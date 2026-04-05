@@ -16,6 +16,43 @@ type ProfileResult = {
 };
 
 const PROFILE_COLUMNS = "id, full_name, avatar_url, created_at, updated_at";
+const PROFILE_AVATAR_BUCKET = "profile-avatars";
+
+export type ProfileAvatarUpload = {
+  fileName?: string | null;
+  mimeType?: string | null;
+  uri: string;
+};
+
+function getFileExtension(photo: ProfileAvatarUpload) {
+  const fromFileName = photo.fileName?.split(".").pop()?.toLowerCase();
+  if (fromFileName) {
+    return fromFileName;
+  }
+
+  const fromUri = photo.uri.split(".").pop()?.split("?")[0]?.toLowerCase();
+  if (fromUri) {
+    return fromUri;
+  }
+
+  if (photo.mimeType === "image/png") {
+    return "png";
+  }
+
+  if (photo.mimeType === "image/heic") {
+    return "heic";
+  }
+
+  return "jpg";
+}
+
+function requireSupabaseClient() {
+  if (!supabase) {
+    throw new Error("Supabase is not configured.");
+  }
+
+  return supabase;
+}
 
 function getProfileDefaults(user: User) {
   const fullName =
@@ -66,5 +103,49 @@ export async function getOrCreateProfile(user: User): Promise<ProfileResult> {
   return {
     data: insertedProfile ?? null,
     error: insertError,
+  };
+}
+
+export async function updateProfile(
+  userId: string,
+  patch: Partial<Pick<ProfileRecord, "avatar_url" | "full_name">>,
+) {
+  return requireSupabaseClient()
+    .from("profiles")
+    .update(patch)
+    .eq("id", userId)
+    .select(PROFILE_COLUMNS)
+    .single();
+}
+
+export async function uploadProfileAvatar(userId: string, photo: ProfileAvatarUpload) {
+  const client = requireSupabaseClient();
+  const response = await fetch(photo.uri);
+  const blob = await response.blob();
+  const extension = getFileExtension(photo);
+  const path = `${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${extension}`;
+
+  const { data, error } = await client.storage
+    .from(PROFILE_AVATAR_BUCKET)
+    .upload(path, blob, {
+      cacheControl: "3600",
+      contentType: photo.mimeType ?? "image/jpeg",
+      upsert: false,
+    });
+
+  if (error) {
+    return { data: null, error };
+  }
+
+  const { data: publicUrlData } = client.storage
+    .from(PROFILE_AVATAR_BUCKET)
+    .getPublicUrl(data.path);
+
+  return {
+    data: {
+      path: data.path,
+      publicUrl: publicUrlData.publicUrl,
+    },
+    error: null,
   };
 }

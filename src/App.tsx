@@ -3,7 +3,9 @@ import type { Session } from "@supabase/supabase-js";
 import {
   IoArrowForward,
   IoCameraOutline,
+  IoCloudUploadOutline,
   IoCubeOutline,
+  IoDocumentTextOutline,
   IoHome,
   IoHomeOutline,
   IoImagesOutline,
@@ -22,14 +24,21 @@ import { useLocation, useNavigate } from "react-router-dom";
 import BrandMark from "./components/BrandMark";
 import {
   createPantryItem,
+  bulkCreatePantryItems,
   deletePantryItem,
   getPantryItem,
   listPantryItems,
+  type PantryItemInsert,
   type PantryItemRecord,
   updatePantryItem,
   uploadPantryItemPhoto,
 } from "./lib/pantry-items";
-import { getOrCreateProfile, type ProfileRecord } from "./lib/profiles";
+import {
+  getOrCreateProfile,
+  type ProfileRecord,
+  updateProfile,
+  uploadProfileAvatar,
+} from "./lib/profiles";
 import {
   isSupabaseConfigured,
   signInWithEmailPassword,
@@ -44,6 +53,9 @@ type CategoryValue = "Fruits & Veggies" | "Fridge Items" | "Pantry";
 type FieldKey = "email" | "password" | "confirmPassword";
 type FieldErrors = Partial<Record<FieldKey, string>>;
 type PantryItemStatus = "expired" | "expiring_soon" | "safe";
+type ParsedBulkRow = PantryItemInsert & {
+  previewKey: string;
+};
 
 const CATEGORY_OPTIONS = [
   {
@@ -79,6 +91,15 @@ const CATEGORY_OPTIONS = [
   title: string;
 }>;
 
+const EXPECTED_FIELDS = [
+  "category",
+  "name",
+  "quantity",
+  "expiry_date",
+  "notes",
+  "photo_url",
+] as const;
+
 function cn(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
 }
@@ -86,6 +107,116 @@ function cn(...parts: Array<string | false | null | undefined>) {
 function trimOptionalValue(value: string) {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeHeader(header: string) {
+  return header.trim().toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function formatCellValue(value: unknown) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  return String(value).trim();
+}
+
+function parseQuantity(value: unknown) {
+  const normalized = formatCellValue(value);
+  if (!normalized) {
+    return 1;
+  }
+
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseExpiryDate(value: unknown, xlsx: typeof import("xlsx")) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  if (typeof value === "number") {
+    const parsed = xlsx.SSF.parse_date_code(value);
+    if (!parsed) {
+      return null;
+    }
+
+    return `${String(parsed.y).padStart(4, "0")}-${String(parsed.m).padStart(2, "0")}-${String(parsed.d).padStart(2, "0")}`;
+  }
+
+  const normalized = formatCellValue(value);
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  return parsed.toISOString().slice(0, 10);
+}
+
+function parseWorkbookRows(
+  workbook: import("xlsx").WorkBook,
+  xlsx: typeof import("xlsx"),
+) {
+  const firstSheetName = workbook.SheetNames[0];
+  const firstSheet = workbook.Sheets[firstSheetName];
+  const rawRows = xlsx.utils.sheet_to_json<Record<string, unknown>>(firstSheet, {
+    defval: "",
+    raw: true,
+  });
+
+  const normalizedRows = rawRows.map((row) => {
+    return Object.fromEntries(
+      Object.entries(row).map(([key, value]) => [normalizeHeader(key), value]),
+    );
+  });
+
+  const issues: string[] = [];
+  const parsedRows: ParsedBulkRow[] = [];
+
+  normalizedRows.forEach((row, index) => {
+    const category = formatCellValue(row.category) || "Pantry";
+    const name = formatCellValue(row.name);
+    const quantity = parseQuantity(row.quantity);
+    const expiryDate = parseExpiryDate(
+      row.expiry_date || row.expiry || row.expiration_date,
+      xlsx,
+    );
+    const notes = formatCellValue(row.notes) || null;
+    const photoUrl = formatCellValue(row.photo_url) || null;
+    const rowLabel = `Row ${index + 2}`;
+
+    if (!name && !formatCellValue(row.notes) && !formatCellValue(row.category)) {
+      return;
+    }
+
+    if (!name) {
+      issues.push(`${rowLabel} is missing a name.`);
+      return;
+    }
+
+    if (quantity === null) {
+      issues.push(`${rowLabel} has an invalid quantity.`);
+      return;
+    }
+
+    parsedRows.push({
+      category,
+      expiry_date: expiryDate,
+      name,
+      notes,
+      photo_url: photoUrl,
+      previewKey: `${rowLabel}-${name}`,
+      quantity,
+      unit: null,
+    });
+  });
+
+  return { issues, parsedRows };
 }
 
 function formatExpiryCopy(expiryDate: string | null) {
@@ -538,9 +669,11 @@ type DashboardScreenProps = {
   isLoggingOut: boolean;
   isProfileLoading: boolean;
   onLogout: () => void;
+  onOpenBulkUpload: () => void;
   onOpenCreate: () => void;
   onOpenEdit: (item: PantryItemRecord) => void;
   onOpenExpired: () => void;
+  onProfileUpdated: (profile: ProfileRecord) => void;
   onShowToast: (message: string) => void;
   onTabChange: (tab: TabKey) => void;
   profile: ProfileRecord | null;
@@ -556,9 +689,11 @@ function DashboardScreen({
   isLoggingOut,
   isProfileLoading,
   onLogout,
+  onOpenBulkUpload,
   onOpenCreate,
   onOpenEdit,
   onOpenExpired,
+  onProfileUpdated,
   onShowToast,
   onTabChange,
   profile,
@@ -575,6 +710,11 @@ function DashboardScreen({
   const [deletingItemId, setDeletingItemId] = useState<string | null>(null);
   const [updatingQuantityId, setUpdatingQuantityId] = useState<string | null>(null);
   const [showExpiryRunwayCard, setShowExpiryRunwayCard] = useState(true);
+  const [previewImageItem, setPreviewImageItem] = useState<PantryItemRecord | null>(null);
+  const [isUpdatingAvatar, setIsUpdatingAvatar] = useState(false);
+  const [showAvatarChooser, setShowAvatarChooser] = useState(false);
+  const cameraAvatarInputRef = useRef<HTMLInputElement | null>(null);
+  const libraryAvatarInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     let isMounted = true;
@@ -685,6 +825,7 @@ function DashboardScreen({
   const nearExpiryCount = upcomingExpiryItems.length;
   const totalItems = pantryItems.length;
   const profileInitial = displayName.trim().charAt(0).toUpperCase() || "B";
+  const profileAvatarUrl = profile?.avatar_url?.trim() || null;
 
   const tabs: Array<{
     activeIcon: ReactNode;
@@ -797,6 +938,83 @@ function DashboardScreen({
     }
   }
 
+  async function handleAvatarFile(file: File) {
+    const objectUrl = URL.createObjectURL(file);
+
+    try {
+      setIsUpdatingAvatar(true);
+
+      const { data: uploadData, error: uploadError } = await uploadProfileAvatar(userId, {
+        fileName: file.name,
+        mimeType: file.type,
+        uri: objectUrl,
+      });
+
+      if (uploadError) {
+        throw uploadError;
+      }
+
+      const { data, error } = await updateProfile(userId, {
+        avatar_url: uploadData.publicUrl,
+      });
+
+      if (error) {
+        throw error;
+      }
+
+      onProfileUpdated(data);
+      onShowToast("Avatar updated.");
+      setShowAvatarChooser(false);
+    } catch (error) {
+      window.alert(
+        error instanceof Error ? error.message : "Couldn't update avatar. Please try again.",
+      );
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+      setIsUpdatingAvatar(false);
+    }
+  }
+
+  function handleAvatarInputChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    void handleAvatarFile(file);
+  }
+
+  async function handleRemoveAvatar() {
+    const confirmed = window.confirm("Remove your avatar from the app profile?");
+
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      setIsUpdatingAvatar(true);
+      const { data, error } = await updateProfile(userId, {
+        avatar_url: null,
+      });
+
+      if (error) {
+        throw error;
+      }
+
+      onProfileUpdated(data);
+      onShowToast("Avatar removed.");
+      setShowAvatarChooser(false);
+    } catch (error) {
+      window.alert(
+        error instanceof Error ? error.message : "Couldn't remove avatar. Please try again.",
+      );
+    } finally {
+      setIsUpdatingAvatar(false);
+    }
+  }
+
   function renderOverview() {
     if (isItemsLoading && pantryItems.length === 0) {
       return (
@@ -839,14 +1057,33 @@ function DashboardScreen({
               </p>
             </div>
 
-            <button
-              aria-label="Open alerts"
-              className="icon-button"
-              type="button"
-              onClick={() => onTabChange("alerts")}
-            >
-              !
-            </button>
+            <div className="header-action-row">
+              <button
+                aria-label="Open profile"
+                className="header-avatar-button"
+                type="button"
+                onClick={() => onTabChange("profile")}
+              >
+                {profileAvatarUrl ? (
+                  <img
+                    alt="Profile avatar"
+                    className="header-avatar-image"
+                    src={profileAvatarUrl}
+                  />
+                ) : (
+                  <span className="header-avatar-fallback">{profileInitial}</span>
+                )}
+              </button>
+
+              <button
+                aria-label="Open alerts"
+                className="icon-button"
+                type="button"
+                onClick={() => onTabChange("alerts")}
+              >
+                !
+              </button>
+            </div>
           </div>
 
           <div className="hero-card">
@@ -898,6 +1135,44 @@ function DashboardScreen({
                 <span className="quick-action__caption">Create a new pantry record</span>
                 <span className="quick-action__hint">
                   Tap to Add <IoArrowForward />
+                </span>
+              </span>
+            </button>
+
+            <button
+              className="quick-action quick-action--dark"
+              type="button"
+              onClick={() => onTabChange("inventory")}
+            >
+              <span className="quick-action__bubble">
+                <IoLayersOutline />
+              </span>
+              <span className="quick-action__body">
+                <span className="quick-action__label">View Inventory</span>
+                <span className="quick-action__caption">Scan all active pantry rows</span>
+                <span className="quick-action__hint">
+                  Open Inventory <IoArrowForward />
+                </span>
+              </span>
+            </button>
+
+            <button
+              className="quick-action quick-action--light quick-action--full"
+              type="button"
+              onClick={onOpenBulkUpload}
+            >
+              <span className="quick-action__bubble quick-action__bubble--light">
+                <IoCloudUploadOutline />
+              </span>
+              <span className="quick-action__body">
+                <span className="quick-action__label quick-action__label--dark">
+                  Bulk Upload
+                </span>
+                <span className="quick-action__caption quick-action__caption--dark">
+                  Import .xls, .xlsx, or .csv files in one flow
+                </span>
+                <span className="quick-action__hint quick-action__hint--dark">
+                  Choose Spreadsheet <IoArrowForward />
                 </span>
               </span>
             </button>
@@ -1034,7 +1309,21 @@ function DashboardScreen({
                 <div className="inventory-row inventory-row--top">
                   <div className="inventory-media">
                     {item.photo_url ? (
-                      <img alt={`${item.name} photo`} className="inventory-image" src={item.photo_url} />
+                      <button
+                        aria-label={`Preview ${item.name} photo`}
+                        className="inventory-image-button"
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setPreviewImageItem(item);
+                        }}
+                      >
+                        <img
+                          alt={`${item.name} photo`}
+                          className="inventory-image"
+                          src={item.photo_url}
+                        />
+                      </button>
                     ) : (
                       <span className="inventory-fallback">o</span>
                     )}
@@ -1218,7 +1507,13 @@ function DashboardScreen({
         <div className="profile-panel">
           <div className="header-row header-row--stretch">
             <div className="profile-main">
-              <div className="avatar-circle">{profileInitial}</div>
+              <div className="avatar-circle">
+                {profileAvatarUrl ? (
+                  <img alt="Profile avatar" className="profile-avatar-image" src={profileAvatarUrl} />
+                ) : (
+                  profileInitial
+                )}
+              </div>
 
               <div className="profile-copy">
                 <h3 className="profile-name">{displayName}</h3>
@@ -1235,6 +1530,64 @@ function DashboardScreen({
               {isLoggingOut ? "Logging Out..." : "Log Out"}
             </button>
           </div>
+
+          <div className="profile-action-row">
+            <button
+              className="secondary-button secondary-button--compact"
+              type="button"
+              onClick={() => setShowAvatarChooser((current) => !current)}
+            >
+              {isUpdatingAvatar ? "Updating..." : profileAvatarUrl ? "Update Avatar" : "Add Avatar"}
+            </button>
+
+            {profileAvatarUrl ? (
+              <button
+                className="delete-chip delete-chip--soft"
+                type="button"
+                onClick={() => void handleRemoveAvatar()}
+              >
+                Remove Avatar
+              </button>
+            ) : null}
+          </div>
+
+          {showAvatarChooser ? (
+            <div className="avatar-choice-row">
+              <button
+                className="secondary-button secondary-button--compact"
+                type="button"
+                onClick={() => cameraAvatarInputRef.current?.click()}
+              >
+                <IoCameraOutline />
+                <span>Take Photo</span>
+              </button>
+
+              <button
+                className="secondary-button secondary-button--compact"
+                type="button"
+                onClick={() => libraryAvatarInputRef.current?.click()}
+              >
+                <IoImagesOutline />
+                <span>Choose Photo</span>
+              </button>
+            </div>
+          ) : null}
+
+          <input
+            ref={cameraAvatarInputRef}
+            accept="image/*"
+            capture="environment"
+            hidden
+            type="file"
+            onChange={handleAvatarInputChange}
+          />
+          <input
+            ref={libraryAvatarInputRef}
+            accept="image/*"
+            hidden
+            type="file"
+            onChange={handleAvatarInputChange}
+          />
 
           <div className="detail-grid">
             <div className="detail-card">
@@ -1298,6 +1651,42 @@ function DashboardScreen({
       </nav>
 
       {toastMessage ? <div className="toast-card">{toastMessage}</div> : null}
+
+      {previewImageItem ? (
+        <div className="preview-overlay" role="dialog" aria-modal="true">
+          <button
+            aria-label="Close image preview"
+            className="preview-backdrop"
+            type="button"
+            onClick={() => setPreviewImageItem(null)}
+          />
+
+          <div className="preview-card">
+            {previewImageItem.photo_url ? (
+              <img
+                alt={`${previewImageItem.name} enlarged photo`}
+                className="preview-image"
+                src={previewImageItem.photo_url}
+              />
+            ) : null}
+
+            <div className="preview-copy">
+              <p className="inventory-name">{previewImageItem.name}</p>
+              <p className="inventory-meta">
+                {previewImageItem.category || "Uncategorized"}
+              </p>
+            </div>
+
+            <button
+              className="preview-close"
+              type="button"
+              onClick={() => setPreviewImageItem(null)}
+            >
+              x
+            </button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1616,6 +2005,203 @@ function PantryItemFormScreen({
               {isSavingItem ? "Saving Item..." : mode === "edit" ? "Save Changes" : "Create Item"}
             </button>
           </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+type BulkUploadScreenProps = {
+  onBack: () => void;
+  onImported: (message: string) => void;
+  userId: string;
+};
+
+function BulkUploadScreen({ onBack, onImported, userId }: BulkUploadScreenProps) {
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [parsedRows, setParsedRows] = useState<ParsedBulkRow[]>([]);
+  const [issues, setIssues] = useState<string[]>([]);
+  const [isImporting, setIsImporting] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  async function handleChooseFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    try {
+      setErrorMessage(null);
+      const xlsx = await import("xlsx");
+      const arrayBuffer = await file.arrayBuffer();
+      const workbook = xlsx.read(arrayBuffer, { type: "array" });
+      const parsed = parseWorkbookRows(workbook, xlsx);
+
+      setFileName(file.name || "Selected spreadsheet");
+      setIssues(parsed.issues);
+      setParsedRows(parsed.parsedRows);
+
+      if (parsed.parsedRows.length === 0) {
+        setErrorMessage("We couldn't find any importable rows in that spreadsheet.");
+      }
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "We couldn't read that spreadsheet. Please try another file.",
+      );
+    }
+  }
+
+  async function handleImport() {
+    if (parsedRows.length === 0 || issues.length > 0) {
+      return;
+    }
+
+    try {
+      setIsImporting(true);
+      setErrorMessage(null);
+
+      const payload: PantryItemInsert[] = parsedRows.map(({ previewKey: _previewKey, ...item }) => item);
+      const { data, error } = await bulkCreatePantryItems(userId, payload);
+
+      if (error) {
+        throw error;
+      }
+
+      onImported(`${data?.length ?? payload.length} items imported.`);
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "We couldn't import the spreadsheet. Please try again.",
+      );
+    } finally {
+      setIsImporting(false);
+    }
+  }
+
+  return (
+    <div className="screen-shell">
+      <div className="scroll-region">
+        <section className="section section--padded-top">
+          <header className="screen-header">
+            <button className="back-button" type="button" onClick={onBack}>
+              &lt;
+            </button>
+            <div>
+              <h2 className="section-title">Bulk Upload Inventory</h2>
+              <p className="body-copy body-copy--left">
+                Import an .xls, .xlsx, or .csv file and turn spreadsheet rows into pantry
+                items in one go.
+              </p>
+            </div>
+          </header>
+
+          <div className="surface-card">
+            <div className="bulk-card-heading">
+              <p className="bulk-card-title">Expected columns</p>
+              <p className="body-copy body-copy--left">
+                Keep the first row as headers. Extra columns are ignored, and missing optional
+                fields stay empty.
+              </p>
+            </div>
+
+            <div className="field-chip-wrap">
+              {EXPECTED_FIELDS.map((field) => (
+                <div key={field} className="field-chip">
+                  <span className="field-chip__text">{field}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="surface-card">
+            <div className="bulk-card-heading">
+              <p className="bulk-card-title">Spreadsheet file</p>
+              <p className="body-copy body-copy--left">
+                Choose a file from your device, then preview the rows before importing.
+              </p>
+            </div>
+
+            <button
+              className="secondary-button secondary-button--wide secondary-button--icon"
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <IoDocumentTextOutline />
+              <span>Choose Spreadsheet</span>
+            </button>
+
+            <input
+              ref={fileInputRef}
+              accept=".csv,.xls,.xlsx"
+              hidden
+              type="file"
+              onChange={handleChooseFile}
+            />
+
+            {fileName ? (
+              <div className="notice notice--neutral">
+                <p className="notice__title">{fileName}</p>
+                <p className="notice__body">
+                  {parsedRows.length} importable row{parsedRows.length === 1 ? "" : "s"} found.
+                </p>
+              </div>
+            ) : null}
+
+            {issues.length > 0 ? (
+              <div className="notice notice--warning">
+                <p className="notice__title">Fix these rows first</p>
+                <p className="notice__body">{issues.slice(0, 4).join(" ")}</p>
+              </div>
+            ) : null}
+
+            {errorMessage ? (
+              <div className="notice notice--danger">
+                <p className="notice__title">Couldn't Continue</p>
+                <p className="notice__body">{errorMessage}</p>
+              </div>
+            ) : null}
+          </div>
+
+          {parsedRows.length > 0 ? (
+            <div className="surface-card">
+              <div className="bulk-card-heading">
+                <p className="bulk-card-title">Preview</p>
+                <p className="body-copy body-copy--left">
+                  We'll import the first sheet only. Here's a quick snapshot of the rows.
+                </p>
+              </div>
+
+              <div className="bulk-preview-list">
+                {parsedRows.slice(0, 5).map((row) => (
+                  <div key={row.previewKey} className="bulk-preview-card">
+                    <p className="inventory-name">{row.name}</p>
+                    <p className="inventory-meta">
+                      {row.category || "Pantry"} / Qty {row.quantity}
+                    </p>
+                    <p className="inventory-meta">
+                      {row.expiry_date ? `Expires ${row.expiry_date}` : "No expiry date"}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          <button
+            className="submit-button submit-button--icon submit-button--spaced"
+            disabled={parsedRows.length === 0 || issues.length > 0 || isImporting}
+            type="button"
+            onClick={() => void handleImport()}
+          >
+            <IoCloudUploadOutline />
+            <span>{isImporting ? "Importing..." : "Import Items"}</span>
+          </button>
         </section>
       </div>
     </div>
@@ -2100,6 +2686,10 @@ export default function App() {
     setDashboardToastMessage(message);
   }
 
+  function handleProfileUpdated(nextProfile: ProfileRecord) {
+    setProfile(nextProfile);
+  }
+
   function goHome() {
     navigate("/");
   }
@@ -2114,6 +2704,10 @@ export default function App() {
 
   function goToExpired() {
     navigate("/expired");
+  }
+
+  function goToBulkUpload() {
+    navigate("/bulk-upload");
   }
 
   if (splashVisible) {
@@ -2164,6 +2758,19 @@ export default function App() {
     );
   }
 
+  if (location.pathname === "/bulk-upload") {
+    return (
+      <BulkUploadScreen
+        onBack={goHome}
+        onImported={(message) => {
+          handlePantryItemSaved(message);
+          goHome();
+        }}
+        userId={session.user.id}
+      />
+    );
+  }
+
   return (
     <div className="app-shell">
       <div className="device-frame">
@@ -2173,9 +2780,11 @@ export default function App() {
           isLoggingOut={isSigningOut}
           isProfileLoading={isProfileLoading}
           onLogout={handleLogout}
+          onOpenBulkUpload={goToBulkUpload}
           onOpenCreate={goToCreate}
           onOpenEdit={goToEdit}
           onOpenExpired={goToExpired}
+          onProfileUpdated={handleProfileUpdated}
           onShowToast={setDashboardToastMessage}
           onTabChange={setActiveTab}
           profile={profile}

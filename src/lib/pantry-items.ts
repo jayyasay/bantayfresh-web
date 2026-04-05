@@ -86,6 +86,18 @@ export async function createPantryItem(userId: string, item: PantryItemInsert) {
     .single();
 }
 
+export async function bulkCreatePantryItems(userId: string, items: PantryItemInsert[]) {
+  return requireSupabaseClient()
+    .from("pantry_items")
+    .insert(
+      items.map((item) => ({
+        user_id: userId,
+        ...item,
+      })),
+    )
+    .select(PANTRY_ITEM_COLUMNS);
+}
+
 export async function uploadPantryItemPhoto(userId: string, file: File) {
   const client = requireSupabaseClient();
   const extension = getFileExtension(file);
