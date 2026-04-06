@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react";
 import type { Session } from "@supabase/supabase-js";
 import {
+  IoAdd,
   IoArrowForward,
   IoCameraOutline,
   IoCloudUploadOutline,
@@ -53,6 +54,9 @@ type CategoryValue = "Fruits & Veggies" | "Fridge Items" | "Pantry";
 type FieldKey = "email" | "password" | "confirmPassword";
 type FieldErrors = Partial<Record<FieldKey, string>>;
 type PantryItemStatus = "expired" | "expiring_soon" | "safe";
+type ReminderPreferenceKey =
+  | "notify_one_day_before_expiry"
+  | "notify_three_days_before_expiry";
 type ParsedBulkRow = PantryItemInsert & {
   previewKey: string;
 };
@@ -102,6 +106,26 @@ const EXPECTED_FIELDS = [
 
 function cn(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
+}
+
+function isEditableElement(element: Element | null) {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+
+  return Boolean(
+    element.closest(
+      'input, textarea, select, [contenteditable=""], [contenteditable="true"]',
+    ),
+  );
+}
+
+function getViewportHeight() {
+  if (typeof window === "undefined") {
+    return 0;
+  }
+
+  return window.visualViewport?.height ?? window.innerHeight;
 }
 
 function trimOptionalValue(value: string) {
@@ -709,9 +733,12 @@ function DashboardScreen({
   const [inventoryError, setInventoryError] = useState<string | null>(null);
   const [deletingItemId, setDeletingItemId] = useState<string | null>(null);
   const [updatingQuantityId, setUpdatingQuantityId] = useState<string | null>(null);
-  const [showExpiryRunwayCard, setShowExpiryRunwayCard] = useState(true);
   const [previewImageItem, setPreviewImageItem] = useState<PantryItemRecord | null>(null);
   const [isUpdatingAvatar, setIsUpdatingAvatar] = useState(false);
+  const [savingPreferenceKey, setSavingPreferenceKey] = useState<"one_day" | "three_days" | null>(
+    null,
+  );
+  const [isBottomBarHidden, setIsBottomBarHidden] = useState(false);
   const [showAvatarChooser, setShowAvatarChooser] = useState(false);
   const cameraAvatarInputRef = useRef<HTMLInputElement | null>(null);
   const libraryAvatarInputRef = useRef<HTMLInputElement | null>(null);
@@ -826,6 +853,96 @@ function DashboardScreen({
   const totalItems = pantryItems.length;
   const profileInitial = displayName.trim().charAt(0).toUpperCase() || "B";
   const profileAvatarUrl = profile?.avatar_url?.trim() || null;
+  const formattedCreatedAt = formatProfileDate(profile?.created_at ?? null);
+  const formattedUpdatedAt = formatProfileDate(profile?.updated_at ?? null);
+  const profileSupportsReminderSettings = profile
+    ? Object.prototype.hasOwnProperty.call(profile, "notify_three_days_before_expiry") &&
+      Object.prototype.hasOwnProperty.call(profile, "notify_one_day_before_expiry")
+    : false;
+  const notifyThreeDaysBeforeExpiry = profile?.notify_three_days_before_expiry !== false;
+  const notifyOneDayBeforeExpiry = profile?.notify_one_day_before_expiry !== false;
+  const activityEntries = useMemo(() => {
+    const now = Date.now();
+    const twentyFourHoursAgo = now - 24 * 60 * 60 * 1000;
+    const getTimestamp = (value: string | null | undefined) => {
+      if (!value) {
+        return 0;
+      }
+
+      const parsed = new Date(value).getTime();
+      return Number.isNaN(parsed) ? 0 : parsed;
+    };
+    const itemsForLabel = (items: PantryItemRecord[]) =>
+      items
+        .slice(0, 3)
+        .map((item) => item.name)
+        .join(", ");
+
+    const addedItems = pantryItems
+      .filter((item) => getTimestamp(item.created_at) >= twentyFourHoursAgo)
+      .sort((left, right) => getTimestamp(right.created_at) - getTimestamp(left.created_at));
+
+    const updatedItems = pantryItems
+      .filter((item) => {
+        const createdAt = getTimestamp(item.created_at);
+        const updatedAt = getTimestamp(item.updated_at);
+        return updatedAt >= twentyFourHoursAgo && updatedAt - createdAt > 60 * 1000;
+      })
+      .sort((left, right) => getTimestamp(right.updated_at) - getTimestamp(left.updated_at));
+
+    const recentlyExpiredItems = pantryItems
+      .filter((item) => {
+        if (!item.expiry_date) {
+          return false;
+        }
+
+        const expiryTime = new Date(`${item.expiry_date}T00:00:00`).getTime();
+        return expiryTime >= twentyFourHoursAgo && expiryTime <= now;
+      })
+      .sort((left, right) => {
+        return (
+          new Date(`${right.expiry_date}T00:00:00`).getTime() -
+          new Date(`${left.expiry_date}T00:00:00`).getTime()
+        );
+      });
+
+    const entries: Array<{ accent: string; body: string; title: string }> = [];
+
+    if (addedItems.length > 0) {
+      entries.push({
+        accent: "#1ebc69",
+        body:
+          addedItems.length === 1
+            ? `${addedItems[0].name} was added in the last 24 hours.`
+            : `${addedItems.length} items were added recently: ${itemsForLabel(addedItems)}${addedItems.length > 3 ? "..." : ""}`,
+        title: "New stock logged",
+      });
+    }
+
+    if (updatedItems.length > 0) {
+      entries.push({
+        accent: "#D7A74A",
+        body:
+          updatedItems.length === 1
+            ? `${updatedItems[0].name} was updated in the last 24 hours.`
+            : `${updatedItems.length} items were updated recently: ${itemsForLabel(updatedItems)}${updatedItems.length > 3 ? "..." : ""}`,
+        title: "Records updated",
+      });
+    }
+
+    if (recentlyExpiredItems.length > 0) {
+      entries.push({
+        accent: "#D45A5A",
+        body:
+          recentlyExpiredItems.length === 1
+            ? `${recentlyExpiredItems[0].name} crossed into expiry in the last 24 hours.`
+            : `${recentlyExpiredItems.length} items expired recently: ${itemsForLabel(recentlyExpiredItems)}${recentlyExpiredItems.length > 3 ? "..." : ""}`,
+        title: "Freshness changed",
+      });
+    }
+
+    return entries.slice(0, 3);
+  }, [pantryItems]);
 
   const tabs: Array<{
     activeIcon: ReactNode;
@@ -853,6 +970,59 @@ function DashboardScreen({
       label: "Profile",
     },
   ];
+  const visibleTabs = tabs.filter((tab) => {
+    if (tab.key === "alerts") {
+      return nearExpiryCount > 0;
+    }
+
+    return true;
+  });
+  const shouldSpreadTabs = visibleTabs.length === 4;
+
+  useEffect(() => {
+    if (activeTab === "alerts" && nearExpiryCount === 0) {
+      onTabChange("home");
+    }
+  }, [activeTab, nearExpiryCount, onTabChange]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+
+    const visualViewport = window.visualViewport;
+    let maxViewportHeight = getViewportHeight();
+
+    const updateBottomBarVisibility = () => {
+      const nextViewportHeight = getViewportHeight();
+      maxViewportHeight = Math.max(maxViewportHeight, nextViewportHeight);
+
+      const keyboardLikelyOpen =
+        isEditableElement(document.activeElement) &&
+        maxViewportHeight - nextViewportHeight > 120;
+
+      setIsBottomBarHidden(keyboardLikelyOpen);
+    };
+
+    const handleFocusChange = () => {
+      window.setTimeout(updateBottomBarVisibility, 40);
+    };
+
+    window.addEventListener("focusin", handleFocusChange);
+    window.addEventListener("focusout", handleFocusChange);
+    window.addEventListener("orientationchange", updateBottomBarVisibility);
+    visualViewport?.addEventListener("resize", updateBottomBarVisibility);
+    window.addEventListener("resize", updateBottomBarVisibility);
+    updateBottomBarVisibility();
+
+    return () => {
+      window.removeEventListener("focusin", handleFocusChange);
+      window.removeEventListener("focusout", handleFocusChange);
+      window.removeEventListener("orientationchange", updateBottomBarVisibility);
+      visualViewport?.removeEventListener("resize", updateBottomBarVisibility);
+      window.removeEventListener("resize", updateBottomBarVisibility);
+    };
+  }, []);
 
   async function handleQuantityChange(item: PantryItemRecord, delta: number) {
     if (updatingQuantityId) {
@@ -986,6 +1156,10 @@ function DashboardScreen({
     void handleAvatarFile(file);
   }
 
+  function openAvatarOptions() {
+    setShowAvatarChooser((current) => !current);
+  }
+
   async function handleRemoveAvatar() {
     const confirmed = window.confirm("Remove your avatar from the app profile?");
 
@@ -1012,6 +1186,66 @@ function DashboardScreen({
       );
     } finally {
       setIsUpdatingAvatar(false);
+    }
+  }
+
+  async function handleNotificationPreferenceChange(
+    key: ReminderPreferenceKey,
+    value: boolean,
+  ) {
+    if (!profile) {
+      return;
+    }
+
+    const savingKey = key === "notify_one_day_before_expiry" ? "one_day" : "three_days";
+    const previousValue =
+      key === "notify_one_day_before_expiry"
+        ? notifyOneDayBeforeExpiry
+        : notifyThreeDaysBeforeExpiry;
+
+    setSavingPreferenceKey(savingKey);
+    onProfileUpdated({
+      ...profile,
+      [key]: value,
+    });
+
+    try {
+      const patch = {
+        [key]: value,
+      } as Partial<
+        Pick<
+          ProfileRecord,
+          "notify_one_day_before_expiry" | "notify_three_days_before_expiry"
+        >
+      >;
+      const { data, error } = await updateProfile(userId, patch);
+
+      if (error) {
+        throw error;
+      }
+
+      onProfileUpdated(data);
+      onShowToast("Notification settings updated.");
+    } catch (error) {
+      onProfileUpdated({
+        ...profile,
+        [key]: previousValue,
+      });
+
+      const errorMessage =
+        error instanceof Error ? error.message : "Please try again.";
+      const needsDatabaseUpdate =
+        errorMessage.toLowerCase().includes("column") ||
+        errorMessage.toLowerCase().includes("schema cache") ||
+        errorMessage.toLowerCase().includes("does not exist");
+
+      window.alert(
+        needsDatabaseUpdate
+          ? "Notification settings need the latest database update before they can be used."
+          : errorMessage,
+      );
+    } finally {
+      setSavingPreferenceKey(null);
     }
   }
 
@@ -1073,15 +1307,6 @@ function DashboardScreen({
                 ) : (
                   <span className="header-avatar-fallback">{profileInitial}</span>
                 )}
-              </button>
-
-              <button
-                aria-label="Open alerts"
-                className="icon-button"
-                type="button"
-                onClick={() => onTabChange("alerts")}
-              >
-                !
               </button>
             </div>
           </div>
@@ -1157,7 +1382,7 @@ function DashboardScreen({
             </button>
 
             <button
-              className="quick-action quick-action--light quick-action--full"
+              className="quick-action quick-action--light"
               type="button"
               onClick={onOpenBulkUpload}
             >
@@ -1177,61 +1402,31 @@ function DashboardScreen({
               </span>
             </button>
           </div>
-
-          {showExpiryRunwayCard ? (
-            <div className="promo-card">
-              <div className="promo-strip" />
-              <div className="promo-body">
-                <div className="promo-icon">*</div>
-                <div className="promo-copy">
-                  <p className="promo-title">Review Today's Expiry Runway</p>
-                  <p className="body-copy body-copy--left">
-                    Tighten handoffs before the lunch rush by checking stock with short freshness
-                    windows first.
-                  </p>
-                </div>
-                <button
-                  aria-label="Dismiss insight"
-                  className="promo-dismiss"
-                  type="button"
-                  onClick={() => setShowExpiryRunwayCard(false)}
-                >
-                  x
-                </button>
-              </div>
-              <button className="promo-footer" type="button" onClick={() => onTabChange("alerts")}>
-                <span>Open Expiry Alerts</span>
-                <span>&gt;</span>
-              </button>
-            </div>
-          ) : null}
-
-          <div className="info-grid">
-            <div className="info-card">
-              <div className="info-card__icon">*</div>
-              <h3 className="info-card__title">Expiry Watch</h3>
-              <p className="body-copy body-copy--left">
-                Track the batches closest to spoilage and move them first while there's still
-                sell-through time.
-              </p>
-              <button className="text-link" type="button" onClick={onOpenExpired}>
-                {expiredItems.length} Expired in Review
-              </button>
-            </div>
-
-            <div className="info-card">
-              <div className="info-card__icon">o</div>
-              <h3 className="info-card__title">Team Access</h3>
-              <p className="body-copy body-copy--left">
-                Keep profile details, teammates, and alert ownership aligned as your workflow
-                expands.
-              </p>
-              <button className="text-link" type="button" onClick={() => onTabChange("profile")}>
-                Open Profile & Access
-              </button>
-            </div>
-          </div>
         </section>
+
+        {activityEntries.length > 0 ? (
+          <section className="full-bleed-section">
+            <h2 className="section-heading">Today&apos;s Activity</h2>
+            <p className="body-copy body-copy--left">
+              Added, updated, or newly expired items from the last 24 hours.
+            </p>
+
+            <div className="activity-list">
+              {activityEntries.map((entry) => (
+                <div key={entry.title} className="activity-row">
+                  <span
+                    className="activity-dot"
+                    style={{ backgroundColor: entry.accent }}
+                  />
+                  <div className="activity-copy">
+                    <p className="activity-title">{entry.title}</p>
+                    <p className="activity-body">{entry.body}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
       </>
     );
   }
@@ -1248,6 +1443,16 @@ function DashboardScreen({
             </p>
           </div>
         </header>
+
+        <button className="inline-action-card" type="button" onClick={onOpenCreate}>
+          <span className="inline-action-glow" />
+          <span className="inline-action-copy">
+            <span className="inline-action-title">Add New Item</span>
+          </span>
+          <span className="quick-action__bubble inline-action-bubble">
+            <IoAdd />
+          </span>
+        </button>
 
         <div className="search-shell">
           <input
@@ -1270,7 +1475,7 @@ function DashboardScreen({
                 type="button"
                 onClick={() => setSelectedCategoryFilter(category.key)}
               >
-                {category.label} / {category.count}
+                {category.label} · {category.count}
               </button>
             );
           })}
@@ -1498,22 +1703,27 @@ function DashboardScreen({
               </p>
             </div>
 
-            <button className="icon-button" type="button" onClick={onLogout}>
-              {isLoggingOut ? "..." : ">"}
+            <button className="header-danger-action" type="button" onClick={onLogout}>
+              {isLoggingOut ? "Logging Out..." : "Log Out"}
             </button>
           </div>
         </header>
 
         <div className="profile-panel">
-          <div className="header-row header-row--stretch">
+          <div className="header-row">
             <div className="profile-main">
-              <div className="avatar-circle">
+              <button
+                aria-label={profileAvatarUrl ? "Update or remove avatar" : "Add avatar"}
+                className="avatar-circle avatar-circle--button"
+                type="button"
+                onClick={openAvatarOptions}
+              >
                 {profileAvatarUrl ? (
                   <img alt="Profile avatar" className="profile-avatar-image" src={profileAvatarUrl} />
                 ) : (
                   profileInitial
                 )}
-              </div>
+              </button>
 
               <div className="profile-copy">
                 <h3 className="profile-name">{displayName}</h3>
@@ -1525,34 +1735,15 @@ function DashboardScreen({
                 </p>
               </div>
             </div>
-
-            <button className="secondary-button secondary-button--compact" type="button" onClick={onLogout}>
-              {isLoggingOut ? "Logging Out..." : "Log Out"}
-            </button>
           </div>
 
-          <div className="profile-action-row">
-            <button
-              className="secondary-button secondary-button--compact"
-              type="button"
-              onClick={() => setShowAvatarChooser((current) => !current)}
-            >
-              {isUpdatingAvatar ? "Updating..." : profileAvatarUrl ? "Update Avatar" : "Add Avatar"}
-            </button>
-
-            {profileAvatarUrl ? (
-              <button
-                className="delete-chip delete-chip--soft"
-                type="button"
-                onClick={() => void handleRemoveAvatar()}
-              >
-                Remove Avatar
-              </button>
-            ) : null}
-          </div>
+          <p className="profile-meta">
+            Tap the avatar to {profileAvatarUrl ? "update or remove it" : "upload a profile photo"}.
+            {isUpdatingAvatar ? " Updating..." : ""}
+          </p>
 
           {showAvatarChooser ? (
-            <div className="avatar-choice-row">
+            <div className="avatar-choice-row avatar-choice-row--card">
               <button
                 className="secondary-button secondary-button--compact"
                 type="button"
@@ -1570,6 +1761,16 @@ function DashboardScreen({
                 <IoImagesOutline />
                 <span>Choose Photo</span>
               </button>
+
+              {profileAvatarUrl ? (
+                <button
+                  className="delete-chip delete-chip--soft"
+                  type="button"
+                  onClick={() => void handleRemoveAvatar()}
+                >
+                  Remove Photo
+                </button>
+              ) : null}
             </div>
           ) : null}
 
@@ -1589,22 +1790,89 @@ function DashboardScreen({
             onChange={handleAvatarInputChange}
           />
 
+          <div className="settings-card">
+            <div className="setting-row">
+              <div className="setting-copy">
+                <p className="setting-title">Notify me 3 days before expiry</p>
+                <p className="setting-body">
+                  Receive an email reminder when an item enters the 3-day window.
+                </p>
+              </div>
+
+              <button
+                aria-checked={notifyThreeDaysBeforeExpiry}
+                className={cn(
+                  "switch",
+                  notifyThreeDaysBeforeExpiry && "switch--active",
+                  (!profileSupportsReminderSettings || savingPreferenceKey !== null) &&
+                    "switch--disabled",
+                )}
+                disabled={!profileSupportsReminderSettings || savingPreferenceKey !== null}
+                role="switch"
+                type="button"
+                onClick={() =>
+                  void handleNotificationPreferenceChange(
+                    "notify_three_days_before_expiry",
+                    !notifyThreeDaysBeforeExpiry,
+                  )
+                }
+              >
+                <span className="switch__thumb" />
+              </button>
+            </div>
+
+            <div className="settings-divider" />
+
+            <div className="setting-row">
+              <div className="setting-copy">
+                <p className="setting-title">Notify me 1 day before expiry</p>
+                <p className="setting-body">
+                  Receive a final reminder one day before expiry.
+                </p>
+              </div>
+
+              <button
+                aria-checked={notifyOneDayBeforeExpiry}
+                className={cn(
+                  "switch",
+                  notifyOneDayBeforeExpiry && "switch--active",
+                  (!profileSupportsReminderSettings || savingPreferenceKey !== null) &&
+                    "switch--disabled",
+                )}
+                disabled={!profileSupportsReminderSettings || savingPreferenceKey !== null}
+                role="switch"
+                type="button"
+                onClick={() =>
+                  void handleNotificationPreferenceChange(
+                    "notify_one_day_before_expiry",
+                    !notifyOneDayBeforeExpiry,
+                  )
+                }
+              >
+                <span className="switch__thumb" />
+              </button>
+            </div>
+          </div>
+
+          {!profileSupportsReminderSettings ? (
+            <p className="profile-meta">
+              Notification preferences will unlock after you run the latest profile/settings SQL
+              update in Supabase.
+            </p>
+          ) : null}
+
           <div className="detail-grid">
             <div className="detail-card">
               <p className="detail-label">Full Name</p>
               <p className="detail-value">{profile?.full_name || displayName}</p>
             </div>
             <div className="detail-card">
-              <p className="detail-label">Avatar URL</p>
-              <p className="detail-value detail-value--truncate">{profile?.avatar_url || "Not set"}</p>
-            </div>
-            <div className="detail-card">
               <p className="detail-label">Created</p>
-              <p className="detail-value">{formatProfileDate(profile?.created_at ?? null)}</p>
+              <p className="detail-value">{formattedCreatedAt}</p>
             </div>
             <div className="detail-card">
               <p className="detail-label">Last Updated</p>
-              <p className="detail-value">{formatProfileDate(profile?.updated_at ?? null)}</p>
+              <p className="detail-value">{formattedUpdatedAt}</p>
             </div>
           </div>
         </div>
@@ -1632,18 +1900,40 @@ function DashboardScreen({
     <div className="dashboard-shell">
       <div className="scroll-region">{renderContent()}</div>
 
-      <nav className="bottom-bar">
-        {tabs.map((tab) => {
+      <nav
+        className={cn(
+          "bottom-bar",
+          shouldSpreadTabs && "bottom-bar--spread",
+          isBottomBarHidden && "bottom-bar--hidden",
+        )}
+      >
+        {visibleTabs.map((tab) => {
           const active = tab.key === activeTab;
+          const isAlertsTab = tab.key === "alerts";
+          const badgeCount = isAlertsTab ? nearExpiryCount : 0;
 
           return (
             <button
               key={tab.key}
-              className={cn("bottom-tab", active && "bottom-tab--active")}
+              className={cn(
+                "bottom-tab",
+                active && "bottom-tab--active",
+                isAlertsTab && "bottom-tab--alerts",
+                isAlertsTab && active && "bottom-tab--alerts-active",
+              )}
               type="button"
               onClick={() => onTabChange(tab.key)}
             >
-              <span className="bottom-tab__icon">{active ? tab.activeIcon : tab.icon}</span>
+              <span className="bottom-tab__icon-wrap">
+                <span className="bottom-tab__icon">{active ? tab.activeIcon : tab.icon}</span>
+                {badgeCount > 0 ? (
+                  <span className="bottom-tab__badge">
+                    <span className="bottom-tab__badge-text">
+                      {badgeCount > 99 ? "99+" : badgeCount}
+                    </span>
+                  </span>
+                ) : null}
+              </span>
               <span className="bottom-tab__text">{tab.label}</span>
             </button>
           );

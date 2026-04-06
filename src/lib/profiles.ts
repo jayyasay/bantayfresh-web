@@ -6,6 +6,8 @@ export type ProfileRecord = {
   id: string;
   full_name: string | null;
   avatar_url: string | null;
+  notify_one_day_before_expiry?: boolean | null;
+  notify_three_days_before_expiry?: boolean | null;
   created_at: string | null;
   updated_at: string | null;
 };
@@ -15,7 +17,7 @@ type ProfileResult = {
   error: Error | PostgrestError | null;
 };
 
-const PROFILE_COLUMNS = "id, full_name, avatar_url, created_at, updated_at";
+const PROFILE_COLUMNS = "*";
 const PROFILE_AVATAR_BUCKET = "profile-avatars";
 
 export type ProfileAvatarUpload = {
@@ -68,6 +70,8 @@ function getProfileDefaults(user: User) {
     avatar_url: avatarUrl,
     full_name: fullName,
     id: user.id,
+    notify_one_day_before_expiry: true,
+    notify_three_days_before_expiry: true,
   };
 }
 
@@ -108,7 +112,15 @@ export async function getOrCreateProfile(user: User): Promise<ProfileResult> {
 
 export async function updateProfile(
   userId: string,
-  patch: Partial<Pick<ProfileRecord, "avatar_url" | "full_name">>,
+  patch: Partial<
+    Pick<
+      ProfileRecord,
+      | "avatar_url"
+      | "full_name"
+      | "notify_one_day_before_expiry"
+      | "notify_three_days_before_expiry"
+    >
+  >,
 ) {
   return requireSupabaseClient()
     .from("profiles")
