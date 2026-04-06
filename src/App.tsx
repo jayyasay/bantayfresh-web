@@ -563,7 +563,7 @@ function SplashScreen() {
       <div className="splash-center">
         <div className="splash-mark-wrap">
           <div className="splash-glow" />
-          <BrandMark />
+          <BrandMark showFrame={false} fillParent />
         </div>
         <h1 className="splash-title">BantayFresh</h1>
       </div>
@@ -574,19 +574,21 @@ function SplashScreen() {
 function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [fullName, setFullName] = useState("");
-  const [organization, setOrganization] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [authNotice, setAuthNotice] = useState<{
+    body: string;
+    title: string;
+  } | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   useEffect(() => {
     setFieldErrors({});
     setErrorMessage(null);
-    setSuccessMessage(null);
   }, [authMode]);
 
   function validateForm() {
@@ -621,6 +623,7 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
     setFieldErrors(nextErrors);
     setErrorMessage(null);
     setSuccessMessage(null);
+    setAuthNotice(null);
 
     if (Object.keys(nextErrors).length > 0) {
       return;
@@ -656,7 +659,6 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
         options: {
           data: {
             full_name: fullName.trim() || undefined,
-            organization: organization.trim() || undefined,
           },
         },
       });
@@ -671,9 +673,16 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
         return;
       }
 
-      setSuccessMessage(
-        "Account created. Check your email to verify it before your first sign in.",
-      );
+      const normalizedEmail = email.trim().toLowerCase();
+      const confirmationBody = normalizedEmail
+        ? `Email confirmation has been sent to ${normalizedEmail}. Please confirm your email before proceeding to login.`
+        : "Email confirmation has been sent. Please confirm your email before proceeding to login.";
+
+      setSuccessMessage(null);
+      setAuthNotice({
+        body: confirmationBody,
+        title: "Confirm your email first",
+      });
       setPassword("");
       setConfirmPassword("");
       setAuthMode("login");
@@ -695,7 +704,7 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
           <div className="auth-banner__stripe auth-banner__stripe--two" />
           <div className="auth-banner__stripe auth-banner__stripe--three" />
           <div className="auth-banner__mark">
-            <BrandMark />
+            <BrandMark showFrame={false} fillParent />
           </div>
         </div>
 
@@ -704,19 +713,30 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
             <p className="eyebrow">{authMode === "login" ? "Welcome back" : "Join BantayFresh"}</p>
             <p className="body-copy">
               {authMode === "login"
-                ? "Sign in to manage freshness alerts, supplier updates, and stock visibility."
-                : "Create your access and start tracking inventory health with your team."}
+                ? "Sign in to check what needs using soon, keep your pantry in order, and stay on top of what matters."
+                : "Create your account to start tracking what you have, what is running low, and what needs attention next."}
             </p>
           </div>
 
           <div className="form-card">
+            {authNotice ? (
+              <div className="auth-notice-card">
+                <p className="auth-notice-card__title">{authNotice.title}</p>
+                <p className="auth-notice-card__body">{authNotice.body}</p>
+              </div>
+            ) : null}
+
             <h2 className="form-title">{authMode === "login" ? "Sign In" : "Create Account"}</h2>
 
             <div className="auth-switch">
               <button
                 className={cn("auth-switch__button", authMode === "login" && "auth-switch__button--active")}
                 type="button"
-                onClick={() => setAuthMode("login")}
+                onClick={() => {
+                  setSuccessMessage(null);
+                  setAuthNotice(null);
+                  setAuthMode("login");
+                }}
               >
                 Login
               </button>
@@ -726,7 +746,11 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
                   authMode === "register" && "auth-switch__button--active",
                 )}
                 type="button"
-                onClick={() => setAuthMode("register")}
+                onClick={() => {
+                  setSuccessMessage(null);
+                  setAuthNotice(null);
+                  setAuthMode("register");
+                }}
               >
                 Register
               </button>
@@ -752,26 +776,13 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
                 <input
                   autoComplete="email"
                   className="field-input"
-                  placeholder="you@company.com"
+                  placeholder="you@example.com"
                   type="email"
                   value={email}
                   onChange={(event) => setEmail(event.target.value)}
                 />
                 {fieldErrors.email ? <p className="field-error">{fieldErrors.email}</p> : null}
               </label>
-
-              {authMode === "register" ? (
-                <label className="field-shell">
-                  <span className="field-label">Organization</span>
-                  <input
-                    className="field-input"
-                    placeholder="Your company or team"
-                    type="text"
-                    value={organization}
-                    onChange={(event) => setOrganization(event.target.value)}
-                  />
-                </label>
-              ) : null}
 
               <label className="field-shell">
                 <span className="field-label">Password</span>
@@ -811,8 +822,24 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
             ) : null}
 
             {successMessage ? (
-              <StatusNotice body={successMessage} title="Ready" tone="success" />
+              <div className="auth-confirmation">
+                <p className="auth-confirmation__text">{successMessage}</p>
+              </div>
             ) : null}
+
+            {authMode === "login" ? (
+              <div className="auth-support-row">
+                <p className="auth-support-text">Session stays saved on this device</p>
+                <p className="auth-support-text auth-support-text--accent">Email + Password</p>
+              </div>
+            ) : (
+              <div className="auth-helper-stack">
+                <p className="auth-support-text">Password needs at least 8 characters</p>
+                <p className="auth-support-text auth-support-text--accent">
+                  Email verification may be required
+                </p>
+              </div>
+            )}
 
             <button className="primary-button" type="button" onClick={handleSubmit}>
               {isSubmitting
@@ -821,21 +848,22 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
                   : "Creating Account..."
                 : authMode === "login"
                   ? "Sign In"
-                  : "Create Account"}
+                  : "Sign Up"}
             </button>
 
-            <div className="inline-row">
-              <p className="inline-muted">
-                {authMode === "login" ? "Need an account?" : "Already have one?"}
-              </p>
-              <button
-                className="ghost-link"
-                type="button"
-                onClick={() => setAuthMode(authMode === "login" ? "register" : "login")}
-              >
-                {authMode === "login" ? "Register here" : "Back to login"}
-              </button>
-            </div>
+            <button
+              className="auth-alt-button"
+              type="button"
+              onClick={() => {
+                setSuccessMessage(null);
+                setAuthNotice(null);
+                setAuthMode(authMode === "login" ? "register" : "login");
+              }}
+            >
+              {authMode === "login"
+                ? "Need access? Switch to Register"
+                : "Already have an account? Switch to Login"}
+            </button>
           </div>
         </div>
       </div>
