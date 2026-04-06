@@ -189,6 +189,7 @@ textarea:focus-visible,
 
 .header-copy {
   flex: 1;
+  min-width: 0;
 }
 
 .greeting-title,
@@ -200,8 +201,11 @@ textarea:focus-visible,
 }
 
 .greeting-title {
-  font-size: clamp(2rem, 4vw, 2.2rem);
+  font-size: clamp(1.35rem, 3.5vw, 1.85rem);
   line-height: 1.05;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .section-title {
@@ -1106,6 +1110,7 @@ textarea:focus-visible,
 
 .profile-main {
   display: flex;
+  align-items: center;
   gap: 14px;
   flex: 1;
 }
@@ -1132,8 +1137,11 @@ textarea:focus-visible,
 }
 
 .profile-copy {
-  display: grid;
-  gap: 6px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 76px;
+  gap: 2px;
 }
 
 .profile-action-row,
@@ -1152,6 +1160,10 @@ textarea:focus-visible,
 
 .profile-name {
   font-size: 1.5rem;
+  line-height: 1.05;
+}
+
+.profile-copy .profile-meta {
   line-height: 1.2;
 }
 
@@ -1373,10 +1385,10 @@ textarea:focus-visible,
 }
 
 .toast-card {
-  position: absolute;
-  left: 20px;
-  right: 20px;
-  bottom: 108px;
+  position: fixed;
+  left: 50%;
+  bottom: calc(102px + env(safe-area-inset-bottom, 0px));
+  width: min(calc(100vw - 40px), 420px);
   border-radius: 22px;
   background: var(--night);
   padding: 14px 16px;
@@ -1385,6 +1397,8 @@ textarea:focus-visible,
   line-height: 1.4;
   font-weight: 700;
   box-shadow: 0 10px 24px rgba(15, 42, 26, 0.22);
+  transform: translateX(-50%);
+  z-index: 50;
 }
 
 .auth-shell {

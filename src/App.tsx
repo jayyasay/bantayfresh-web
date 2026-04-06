@@ -504,6 +504,18 @@ function formatProfileDate(value: string | null) {
   }).format(new Date(value));
 }
 
+function getTimeOfDayGreeting(hour: number) {
+  if (hour >= 5 && hour < 12) {
+    return "Morning";
+  }
+
+  if (hour >= 12 && hour < 18) {
+    return "Afternoon";
+  }
+
+  return "Evening";
+}
+
 function StatusNotice({
   title,
   body,
@@ -885,8 +897,19 @@ function DashboardScreen({
   );
   const [isBottomBarHidden, setIsBottomBarHidden] = useState(false);
   const [showAvatarChooser, setShowAvatarChooser] = useState(false);
+  const [currentHour, setCurrentHour] = useState(() => new Date().getHours());
   const cameraAvatarInputRef = useRef<HTMLInputElement | null>(null);
   const libraryAvatarInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setCurrentHour(new Date().getHours());
+    }, 60_000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     let isMounted = true;
@@ -996,6 +1019,11 @@ function DashboardScreen({
   });
   const nearExpiryCount = upcomingExpiryItems.length;
   const totalItems = pantryItems.length;
+  const greetingTimeOfDay = getTimeOfDayGreeting(currentHour);
+  const greetingSubtitle =
+    nearExpiryCount === 0
+      ? "You are all clear right now. Keep this momentum and your shelves stay fresh."
+      : `You have ${nearExpiryCount} item${nearExpiryCount === 1 ? "" : "s"} entering the 3-day expiry window. Let’s move on them early.`;
   const profileInitial = displayName.trim().charAt(0).toUpperCase() || "B";
   const profileAvatarUrl = profile?.avatar_url?.trim() || null;
   const formattedCreatedAt = formatProfileDate(profile?.created_at ?? null);
@@ -1431,10 +1459,9 @@ function DashboardScreen({
         <header className="dashboard-header">
           <div className="header-row">
             <div className="header-copy">
-              <h1 className="greeting-title">Good Morning, {displayName}</h1>
+              <h1 className="greeting-title">Good {greetingTimeOfDay}, {displayName}</h1>
               <p className="body-copy body-copy--left">
-                Freshness is tighter than ever. {nearExpiryCount} items are in their final 3
-                days before expiry.
+                {greetingSubtitle}
               </p>
             </div>
 
@@ -1468,7 +1495,7 @@ function DashboardScreen({
               <p className="hero-label">Freshness Snapshot</p>
               <p className="hero-value">{totalItems} Active Items</p>
               <p className="hero-meta">
-                Keep sell-through velocity high by prioritizing the shortest freshness windows.
+                Move fast on the soonest-to-expire items first so less stock goes to waste.
               </p>
               <div className="hero-meta-row">
                 <button className="hero-badge" type="button" onClick={onOpenExpired}>
@@ -1591,16 +1618,6 @@ function DashboardScreen({
           </div>
         </header>
 
-        <button className="inline-action-card" type="button" onClick={onOpenCreate}>
-          <span className="inline-action-glow" />
-          <span className="inline-action-copy">
-            <span className="inline-action-title">Add New Item</span>
-          </span>
-          <span className="quick-action__bubble inline-action-bubble">
-            <IoAdd />
-          </span>
-        </button>
-
         <div className="search-shell">
           <input
             className="search-input"
@@ -1610,6 +1627,16 @@ function DashboardScreen({
             onChange={(event) => setSearch(event.target.value)}
           />
         </div>
+
+        <button className="inline-action-card" type="button" onClick={onOpenCreate}>
+          <span className="inline-action-glow" />
+          <span className="inline-action-copy">
+            <span className="inline-action-title">Add New Item</span>
+          </span>
+          <span className="quick-action__bubble inline-action-bubble">
+            <IoAdd />
+          </span>
+        </button>
 
         <div className="filter-wrap">
           {categoryFilters.map((category) => {
@@ -1855,9 +1882,9 @@ function DashboardScreen({
           <div className="header-row">
             <div className="header-copy">
               <h2 className="section-title">Profile & Access</h2>
-              <p className="body-copy body-copy--left">
-                Keep personal details and workspace access synchronized with the auth session.
-              </p>
+                <p className="body-copy body-copy--left">
+                  View your personal profile details, update your avatar, and log out of the app on this screen.
+                </p>
             </div>
 
             <button className="header-danger-action" type="button" onClick={onLogout}>
@@ -1885,11 +1912,9 @@ function DashboardScreen({
               <div className="profile-copy">
                 <h3 className="profile-name">{displayName}</h3>
                 <p className="profile-meta">{userEmail ?? "No email available"}</p>
-                <p className="profile-meta">
-                  {isProfileLoading
-                    ? "Refreshing profile..."
-                    : "Profile details are loaded from public.profiles."}
-                </p>
+                {isProfileLoading ? (
+                  <p className="profile-meta">Refreshing profile...</p>
+                ) : null}
               </div>
             </div>
           </div>
@@ -2011,12 +2036,9 @@ function DashboardScreen({
             </div>
           </div>
 
-          {!profileSupportsReminderSettings ? (
-            <p className="profile-meta">
-              Notification preferences will unlock after you run the latest profile/settings SQL
-              update in Supabase.
-            </p>
-          ) : null}
+          <p className="profile-meta">
+            Personal details:
+          </p>
 
           <div className="detail-grid">
             <div className="detail-card">
