@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ReactNode,
+} from "react";
 import type { Session } from "@supabase/supabase-js";
 import {
   IoAdd,
@@ -20,7 +28,14 @@ import {
   IoPersonCircleOutline,
   IoSnowOutline,
 } from "react-icons/io5";
-import { useLocation, useNavigate } from "react-router-dom";
+import {
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+  type Location as RouterLocation,
+} from "react-router-dom";
 
 import BrandMark from "./components/BrandMark";
 import {
@@ -104,6 +119,33 @@ const EXPECTED_FIELDS = [
   "photo_url",
 ] as const;
 
+const DASHBOARD_TAB_PATHS: Record<TabKey, string> = {
+  alerts: "/alerts",
+  home: "/",
+  inventory: "/inventory",
+  profile: "/profile",
+};
+
+function isDashboardPath(pathname: string) {
+  return Object.values(DASHBOARD_TAB_PATHS).includes(pathname);
+}
+
+function getDashboardTabFromPath(pathname: string): TabKey {
+  if (pathname === "/inventory") {
+    return "inventory";
+  }
+
+  if (pathname === "/alerts") {
+    return "alerts";
+  }
+
+  if (pathname === "/profile") {
+    return "profile";
+  }
+
+  return "home";
+}
+
 function cn(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
 }
@@ -126,6 +168,108 @@ function getViewportHeight() {
   }
 
   return window.visualViewport?.height ?? window.innerHeight;
+}
+
+function scrollAppContentToTop() {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  const scrollingElement = document.scrollingElement as HTMLElement | null;
+
+  window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  scrollingElement?.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  if (scrollingElement) {
+    scrollingElement.scrollTop = 0;
+    scrollingElement.scrollLeft = 0;
+  }
+  document.documentElement.scrollTop = 0;
+  document.body.scrollTop = 0;
+
+  document.querySelectorAll<HTMLElement>(".scroll-region").forEach((element) => {
+    element.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    element.scrollTop = 0;
+    element.scrollLeft = 0;
+  });
+}
+
+function scrollOverlayContentToTop() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  const overlayScrollRegion = document.querySelector<HTMLElement>(".route-overlay .scroll-region");
+  const overlayContainer = document.querySelector<HTMLElement>(".route-overlay");
+
+  if (overlayContainer) {
+    overlayContainer.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    overlayContainer.scrollTop = 0;
+    overlayContainer.scrollLeft = 0;
+  }
+
+  if (!overlayScrollRegion) {
+    return false;
+  }
+
+  overlayScrollRegion.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  overlayScrollRegion.scrollTop = 0;
+  overlayScrollRegion.scrollLeft = 0;
+  return true;
+}
+
+function scrollCurrentViewToTop() {
+  if (scrollOverlayContentToTop()) {
+    return;
+  }
+
+  scrollAppContentToTop();
+}
+
+function scheduleCurrentViewScrollToTop() {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  const runScrollReset = () => {
+    scrollCurrentViewToTop();
+  };
+
+  runScrollReset();
+  window.requestAnimationFrame(() => {
+    runScrollReset();
+    window.requestAnimationFrame(runScrollReset);
+  });
+  window.setTimeout(runScrollReset, 0);
+}
+
+async function confirmAndDeletePantryItem(
+  userId: string,
+  item: PantryItemRecord,
+  onBeforeDelete?: () => void,
+  onAfterDelete?: () => void,
+) {
+  const confirmed = window.confirm(`Delete ${item.name}? This action cannot be undone.`);
+
+  if (!confirmed) {
+    return { deleted: false, error: null as Error | null };
+  }
+
+  try {
+    onBeforeDelete?.();
+    const { error } = await deletePantryItem(userId, item.id);
+
+    if (error) {
+      throw error;
+    }
+
+    onAfterDelete?.();
+    return { deleted: true, error: null as Error | null };
+  } catch (error) {
+    return {
+      deleted: false,
+      error: error instanceof Error ? error : new Error("Couldn't delete the item. Please try again."),
+    };
+  }
 }
 
 function trimOptionalValue(value: string) {
@@ -726,6 +870,7 @@ function DashboardScreen({
   userEmail,
   userId,
 }: DashboardScreenProps) {
+  const scrollRegionRef = useRef<HTMLDivElement | null>(null);
   const [search, setSearch] = useState("");
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState("all");
   const [pantryItems, setPantryItems] = useState<PantryItemRecord[]>([]);
@@ -985,6 +1130,13 @@ function DashboardScreen({
     }
   }, [activeTab, nearExpiryCount, onTabChange]);
 
+  useLayoutEffect(() => {
+    scrollRegionRef.current?.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    window.requestAnimationFrame(() => {
+      scrollRegionRef.current?.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    });
+  }, [activeTab]);
+
   useEffect(() => {
     if (typeof window === "undefined") {
       return undefined;
@@ -1081,31 +1233,26 @@ function DashboardScreen({
   }
 
   async function handleDeleteItem(item: PantryItemRecord) {
-    const confirmed = window.confirm(`Delete ${item.name}? This action cannot be undone.`);
+    const { deleted, error } = await confirmAndDeletePantryItem(
+      userId,
+      item,
+      () => {
+        setDeletingItemId(item.id);
+      },
+      () => {
+        setPantryItems((currentItems) =>
+          currentItems.filter((currentItem) => currentItem.id !== item.id),
+        );
+      },
+    );
 
-    if (!confirmed) {
-      return;
-    }
-
-    try {
-      setDeletingItemId(item.id);
-      const { error } = await deletePantryItem(userId, item.id);
-
-      if (error) {
-        throw error;
-      }
-
-      setPantryItems((currentItems) =>
-        currentItems.filter((currentItem) => currentItem.id !== item.id),
-      );
+    if (deleted) {
       onShowToast(`${item.name} deleted.`);
-    } catch (error) {
-      window.alert(
-        error instanceof Error ? error.message : "Couldn't delete the item. Please try again.",
-      );
-    } finally {
-      setDeletingItemId(null);
+    } else if (error) {
+      window.alert(error.message);
     }
+
+    setDeletingItemId(null);
   }
 
   async function handleAvatarFile(file: File) {
@@ -1397,7 +1544,7 @@ function DashboardScreen({
                   Import .xls, .xlsx, or .csv files in one flow
                 </span>
                 <span className="quick-action__hint quick-action__hint--dark">
-                  Choose Spreadsheet <IoArrowForward />
+                  Upload <IoArrowForward />
                 </span>
               </span>
             </button>
@@ -1680,6 +1827,16 @@ function DashboardScreen({
                     <span className={cn("inventory-badge", `inventory-badge--${getInventoryBadgeTone(item)}`)}>
                       {getInventoryBadgeCopy(item)}
                     </span>
+                    <button
+                      className="delete-chip"
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void handleDeleteItem(item);
+                      }}
+                    >
+                      {deletingItemId === item.id ? "Deleting..." : "Delete"}
+                    </button>
                     <span className="inventory-link">Edit -&gt;</span>
                   </div>
                 </div>
@@ -1898,7 +2055,9 @@ function DashboardScreen({
 
   return (
     <div className="dashboard-shell">
-      <div className="scroll-region">{renderContent()}</div>
+      <div ref={scrollRegionRef} className="scroll-region">
+        {renderContent()}
+      </div>
 
       <nav
         className={cn(
@@ -1985,6 +2144,7 @@ type PantryItemFormScreenProps = {
   initialItem?: PantryItemRecord | null;
   mode: "create" | "edit";
   onBack: () => void;
+  onDeleted?: (message: string) => void;
   onSaved: (message: string) => void;
   userId: string;
 };
@@ -1993,6 +2153,7 @@ function PantryItemFormScreen({
   initialItem,
   mode,
   onBack,
+  onDeleted,
   onSaved,
   userId,
 }: PantryItemFormScreenProps) {
@@ -2003,8 +2164,8 @@ function PantryItemFormScreen({
   const [photoUri, setPhotoUri] = useState<string | null>(null);
   const [pendingPhotoFile, setPendingPhotoFile] = useState<File | null>(null);
   const [notes, setNotes] = useState("");
-  const [showExpiryPicker, setShowExpiryPicker] = useState(false);
   const [isSavingItem, setIsSavingItem] = useState(false);
+  const [isDeletingItem, setIsDeletingItem] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
   const libraryInputRef = useRef<HTMLInputElement | null>(null);
@@ -2128,6 +2289,32 @@ function PantryItemFormScreen({
     }
   }
 
+  async function handleDeleteCurrentItem() {
+    if (!initialItem || isDeletingItem) {
+      return;
+    }
+
+    const { deleted, error } = await confirmAndDeletePantryItem(
+      userId,
+      initialItem,
+      () => {
+        setIsDeletingItem(true);
+        setErrorMessage(null);
+      },
+    );
+
+    if (deleted) {
+      onDeleted?.(`${initialItem.name} deleted.`);
+      return;
+    }
+
+    if (error) {
+      setErrorMessage(error.message);
+    }
+
+    setIsDeletingItem(false);
+  }
+
   return (
     <div className="screen-shell">
       <div className="scroll-region">
@@ -2217,22 +2404,14 @@ function PantryItemFormScreen({
 
             <div className="field-group">
               <span className="form-label">Expiry Date</span>
-              <button className="picker-button" type="button" onClick={() => setShowExpiryPicker((current) => !current)}>
-                <span className={cn("picker-value", !expiryDate && "picker-value--muted")}>
-                  {expiryDate ? formatExpiryCopy(expiryDate) : "Choose a date..."}
-                </span>
-              </button>
-
-              {showExpiryPicker ? (
-                <div className="picker-panel">
-                  <input
-                    className="date-input"
-                    type="date"
-                    value={expiryDate ?? ""}
-                    onChange={(event) => setExpiryDate(event.target.value || null)}
-                  />
-                </div>
-              ) : null}
+              <div className="input-shell">
+                <input
+                  className="date-input date-input--full"
+                  type="date"
+                  value={expiryDate ?? ""}
+                  onChange={(event) => setExpiryDate(event.target.value || null)}
+                />
+              </div>
 
               {expiryDate ? (
                 <button className="secondary-button secondary-button--wide" type="button" onClick={() => setExpiryDate(null)}>
@@ -2294,6 +2473,17 @@ function PantryItemFormScreen({
             <button className="submit-button" type="button" onClick={handleSave}>
               {isSavingItem ? "Saving Item..." : mode === "edit" ? "Save Changes" : "Create Item"}
             </button>
+
+            {mode === "edit" && initialItem ? (
+              <button
+                className="delete-chip delete-chip--wide"
+                disabled={isDeletingItem || isSavingItem}
+                type="button"
+                onClick={() => void handleDeleteCurrentItem()}
+              >
+                {isDeletingItem ? "Deleting..." : "Delete Item"}
+              </button>
+            ) : null}
           </div>
         </section>
       </div>
@@ -2564,31 +2754,26 @@ function ExpiredItemsScreen({
   }, [pantryItems]);
 
   async function handleDeleteItem(item: PantryItemRecord) {
-    const confirmed = window.confirm(`Delete ${item.name}? This action cannot be undone.`);
+    const { deleted, error } = await confirmAndDeletePantryItem(
+      userId,
+      item,
+      () => {
+        setDeletingItemId(item.id);
+      },
+      () => {
+        setPantryItems((currentItems) =>
+          currentItems.filter((currentItem) => currentItem.id !== item.id),
+        );
+      },
+    );
 
-    if (!confirmed) {
-      return;
-    }
-
-    try {
-      setDeletingItemId(item.id);
-      const { error } = await deletePantryItem(userId, item.id);
-
-      if (error) {
-        throw error;
-      }
-
-      setPantryItems((currentItems) =>
-        currentItems.filter((currentItem) => currentItem.id !== item.id),
-      );
+    if (deleted) {
       onItemsChanged(`${item.name} deleted.`);
-    } catch (error) {
-      window.alert(
-        error instanceof Error ? error.message : "Couldn't delete the item. Please try again.",
-      );
-    } finally {
-      setDeletingItemId(null);
+    } else if (error) {
+      window.alert(error.message);
     }
+
+    setDeletingItemId(null);
   }
 
   return (
@@ -2705,11 +2890,13 @@ function ExpiredItemsScreen({
 function EditPantryItemRoute({
   itemId,
   onBack,
+  onDeleted,
   onSaved,
   userId,
 }: {
   itemId: string;
   onBack: () => void;
+  onDeleted: (message: string) => void;
   onSaved: (message: string) => void;
   userId: string;
 }) {
@@ -2801,17 +2988,30 @@ function EditPantryItemRoute({
   }
 
   return (
-    <PantryItemFormScreen initialItem={item} mode="edit" onBack={onBack} onSaved={onSaved} userId={userId} />
+    <PantryItemFormScreen
+      initialItem={item}
+      mode="edit"
+      onBack={onBack}
+      onDeleted={onDeleted}
+      onSaved={onSaved}
+      userId={userId}
+    />
   );
 }
 
 export default function App() {
   const location = useLocation();
   const navigate = useNavigate();
+  const navigationState = location.state as { backgroundLocation?: RouterLocation } | null;
+  const backgroundLocation =
+    navigationState?.backgroundLocation &&
+    isDashboardPath(navigationState.backgroundLocation.pathname)
+      ? navigationState.backgroundLocation
+      : null;
+  const displayLocation = backgroundLocation ?? location;
   const [session, setSession] = useState<Session | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [showSplash, setShowSplash] = useState(true);
-  const [activeTab, setActiveTab] = useState<TabKey>("home");
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [isProfileLoading, setIsProfileLoading] = useState(false);
   const [profile, setProfile] = useState<ProfileRecord | null>(null);
@@ -2877,7 +3077,6 @@ export default function App() {
       setAuthReady(true);
 
       if (!nextSession) {
-        setActiveTab("home");
         setDashboardToastMessage(null);
         setProfile(null);
         navigate("/", { replace: true });
@@ -2936,6 +3135,27 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [dashboardToastMessage]);
 
+  useLayoutEffect(() => {
+    scheduleCurrentViewScrollToTop();
+  }, [backgroundLocation, location.key, location.pathname]);
+
+  useEffect(() => {
+    if (!backgroundLocation || typeof document === "undefined") {
+      return undefined;
+    }
+
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousHtmlOverflow = document.documentElement.style.overflow;
+
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overflow = "hidden";
+
+    return () => {
+      document.body.style.overflow = previousBodyOverflow;
+      document.documentElement.style.overflow = previousHtmlOverflow;
+    };
+  }, [backgroundLocation]);
+
   const splashVisible = showSplash || !authReady;
   const displayName =
     profile?.full_name?.trim() ||
@@ -2943,8 +3163,10 @@ export default function App() {
     session?.user.email?.split("@")[0] ||
     "there";
   const userEmail = session?.user.email ?? null;
+  const authenticatedUserId = session?.user.id ?? null;
   const editMatch = location.pathname.match(/^\/item\/([^/]+)\/edit$/);
   const editItemId = editMatch ? decodeURIComponent(editMatch[1]) : null;
+  const activeDashboardTab = getDashboardTabFromPath(displayLocation.pathname);
 
   async function handleLogout() {
     if (isSigningOut) {
@@ -2966,7 +3188,6 @@ export default function App() {
   }
 
   function handlePantryItemSaved(message: string) {
-    setActiveTab("home");
     setDashboardRefreshToken((current) => current + 1);
     setDashboardToastMessage(message);
   }
@@ -2980,110 +3201,230 @@ export default function App() {
     setProfile(nextProfile);
   }
 
+  function getOverlayNavigateOptions() {
+    const nextBackgroundLocation =
+      backgroundLocation ?? (isDashboardPath(location.pathname) ? location : null);
+
+    if (!nextBackgroundLocation) {
+      return undefined;
+    }
+
+    return {
+      state: {
+        backgroundLocation: nextBackgroundLocation,
+      },
+    };
+  }
+
   function goHome() {
+    if (backgroundLocation) {
+      navigate(-1);
+      return;
+    }
+
     navigate("/");
   }
 
   function goToCreate() {
-    navigate("/item/new");
+    navigate("/item/new", getOverlayNavigateOptions());
   }
 
   function goToEdit(item: PantryItemRecord) {
-    navigate(`/item/${encodeURIComponent(item.id)}/edit`);
+    navigate(`/item/${encodeURIComponent(item.id)}/edit`, getOverlayNavigateOptions());
   }
 
   function goToExpired() {
-    navigate("/expired");
+    navigate("/expired", getOverlayNavigateOptions());
   }
 
   function goToBulkUpload() {
-    navigate("/bulk-upload");
+    navigate("/bulk-upload", getOverlayNavigateOptions());
+  }
+
+  function goToDashboardTab(tab: TabKey) {
+    navigate(DASHBOARD_TAB_PATHS[tab]);
+  }
+
+  function renderDashboardRoute(tab: TabKey) {
+    return (
+      <div className="app-shell">
+        <div className="device-frame">
+          <DashboardScreen
+            activeTab={tab}
+            displayName={displayName}
+            isLoggingOut={isSigningOut}
+            isProfileLoading={isProfileLoading}
+            onLogout={handleLogout}
+            onOpenBulkUpload={goToBulkUpload}
+            onOpenCreate={goToCreate}
+            onOpenEdit={goToEdit}
+            onOpenExpired={goToExpired}
+            onProfileUpdated={handleProfileUpdated}
+            onShowToast={setDashboardToastMessage}
+            onTabChange={goToDashboardTab}
+            profile={profile}
+            refreshToken={dashboardRefreshToken}
+            toastMessage={dashboardToastMessage}
+            userEmail={userEmail}
+            userId={authenticatedUserId ?? ""}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  function renderOverlay(children: ReactNode) {
+    return (
+      <div key={location.key} className="route-overlay">
+        {children}
+      </div>
+    );
   }
 
   if (splashVisible) {
     return <SplashScreen />;
   }
 
-  if (!session) {
+  if (!session || !authenticatedUserId) {
     return <AuthScreen onAuthSuccess={() => navigate("/")} />;
   }
 
-  if (location.pathname === "/item/new") {
-    return (
-      <PantryItemFormScreen
-        mode="create"
-        onBack={goHome}
-        onSaved={(message) => {
-          handlePantryItemSaved(message);
-          goHome();
-        }}
-        userId={session.user.id}
-      />
-    );
-  }
-
-  if (editItemId) {
-    return (
-      <EditPantryItemRoute
-        itemId={editItemId}
-        onBack={goHome}
-        onSaved={(message) => {
-          handlePantryItemSaved(message);
-          goHome();
-        }}
-        userId={session.user.id}
-      />
-    );
-  }
-
-  if (location.pathname === "/expired") {
-    return (
-      <ExpiredItemsScreen
-        onBack={goHome}
-        onItemsChanged={handlePantryItemsChanged}
-        onOpenEdit={goToEdit}
-        refreshToken={dashboardRefreshToken}
-        userId={session.user.id}
-      />
-    );
-  }
-
-  if (location.pathname === "/bulk-upload") {
-    return (
-      <BulkUploadScreen
-        onBack={goHome}
-        onImported={(message) => {
-          handlePantryItemSaved(message);
-          goHome();
-        }}
-        userId={session.user.id}
-      />
-    );
-  }
-
   return (
-    <div className="app-shell">
-      <div className="device-frame">
-        <DashboardScreen
-          activeTab={activeTab}
-          displayName={displayName}
-          isLoggingOut={isSigningOut}
-          isProfileLoading={isProfileLoading}
-          onLogout={handleLogout}
-          onOpenBulkUpload={goToBulkUpload}
-          onOpenCreate={goToCreate}
-          onOpenEdit={goToEdit}
-          onOpenExpired={goToExpired}
-          onProfileUpdated={handleProfileUpdated}
-          onShowToast={setDashboardToastMessage}
-          onTabChange={setActiveTab}
-          profile={profile}
-          refreshToken={dashboardRefreshToken}
-          toastMessage={dashboardToastMessage}
-          userEmail={userEmail}
-          userId={session.user.id}
+    <>
+      <Routes location={displayLocation}>
+        <Route path="/" element={renderDashboardRoute(activeDashboardTab)} />
+        <Route path="/inventory" element={renderDashboardRoute(activeDashboardTab)} />
+        <Route path="/alerts" element={renderDashboardRoute(activeDashboardTab)} />
+        <Route path="/profile" element={renderDashboardRoute(activeDashboardTab)} />
+        <Route
+          path="/item/new"
+          element={
+            <PantryItemFormScreen
+              mode="create"
+              onBack={goHome}
+              onSaved={(message) => {
+                handlePantryItemSaved(message);
+                goHome();
+              }}
+              userId={authenticatedUserId}
+            />
+          }
         />
-      </div>
-    </div>
+        <Route
+          path="/item/:itemId/edit"
+          element={
+            editItemId ? (
+            <EditPantryItemRoute
+              itemId={editItemId}
+              onBack={goHome}
+              onDeleted={(message) => {
+                handlePantryItemsChanged(message);
+                goHome();
+              }}
+              onSaved={(message) => {
+                handlePantryItemSaved(message);
+                goHome();
+                }}
+                userId={authenticatedUserId}
+              />
+            ) : (
+              <Navigate replace to="/" />
+            )
+          }
+        />
+        <Route
+          path="/expired"
+          element={
+            <ExpiredItemsScreen
+              onBack={goHome}
+              onItemsChanged={handlePantryItemsChanged}
+              onOpenEdit={goToEdit}
+              refreshToken={dashboardRefreshToken}
+              userId={authenticatedUserId}
+            />
+          }
+        />
+        <Route
+          path="/bulk-upload"
+          element={
+            <BulkUploadScreen
+              onBack={goHome}
+              onImported={(message) => {
+                handlePantryItemSaved(message);
+                goHome();
+              }}
+              userId={authenticatedUserId}
+            />
+          }
+        />
+        <Route path="*" element={<Navigate replace to="/" />} />
+      </Routes>
+
+      {backgroundLocation ? (
+        <Routes>
+          <Route
+            path="/item/new"
+            element={renderOverlay(
+              <PantryItemFormScreen
+                mode="create"
+                onBack={goHome}
+                onSaved={(message) => {
+                  handlePantryItemSaved(message);
+                  goHome();
+                }}
+                userId={authenticatedUserId}
+              />,
+            )}
+          />
+          <Route
+            path="/item/:itemId/edit"
+            element={
+              editItemId
+                ? renderOverlay(
+                    <EditPantryItemRoute
+                      itemId={editItemId}
+                      onBack={goHome}
+                      onDeleted={(message) => {
+                        handlePantryItemsChanged(message);
+                        goHome();
+                      }}
+                      onSaved={(message) => {
+                        handlePantryItemSaved(message);
+                        goHome();
+                      }}
+                      userId={authenticatedUserId}
+                    />,
+                  )
+                : <Navigate replace to={backgroundLocation.pathname} />
+            }
+          />
+          <Route
+            path="/expired"
+            element={renderOverlay(
+              <ExpiredItemsScreen
+                onBack={goHome}
+                onItemsChanged={handlePantryItemsChanged}
+                onOpenEdit={goToEdit}
+                refreshToken={dashboardRefreshToken}
+                userId={authenticatedUserId}
+              />,
+            )}
+          />
+          <Route
+            path="/bulk-upload"
+            element={renderOverlay(
+              <BulkUploadScreen
+                onBack={goHome}
+                onImported={(message) => {
+                  handlePantryItemSaved(message);
+                  goHome();
+                }}
+                userId={authenticatedUserId}
+              />,
+            )}
+          />
+        </Routes>
+      ) : null}
+    </>
   );
 }
