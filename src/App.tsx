@@ -46,7 +46,6 @@ import {
   composePantryItemNotes,
   deletePantryItem,
   findPantryItemByBarcode,
-  getBarcodeLookupCandidates,
   getPantryItem,
   getPantryItemBarcode,
   getPantryItemDisplayNotes,
@@ -290,19 +289,27 @@ function trimOptionalValue(value: string) {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function barcodeMatches(scannedBarcode: string, candidateBarcode: string | null) {
-  if (!candidateBarcode) {
-    return false;
-  }
-
-  const scannedCandidates = new Set(getBarcodeLookupCandidates(scannedBarcode));
-  return getBarcodeLookupCandidates(candidateBarcode).some((candidate) =>
-    scannedCandidates.has(candidate),
-  );
-}
-
 function normalizeHeader(header: string) {
   return header.trim().toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function getCreateItemPath(prefill?: PantryItemFormPrefill) {
+  const searchParams = new URLSearchParams();
+
+  if (prefill?.barcode?.trim()) {
+    searchParams.set("barcode", prefill.barcode.trim());
+  }
+
+  if (prefill?.name?.trim()) {
+    searchParams.set("name", prefill.name.trim());
+  }
+
+  if (prefill?.category?.trim()) {
+    searchParams.set("category", prefill.category.trim());
+  }
+
+  const queryString = searchParams.toString();
+  return queryString ? `/item/new?${queryString}` : "/item/new";
 }
 
 function formatCellValue(value: unknown) {
@@ -949,16 +956,11 @@ function DashboardScreen({
   );
   const [isBottomBarHidden, setIsBottomBarHidden] = useState(false);
   const [showQuickScanModal, setShowQuickScanModal] = useState(false);
-  const [isResolvingScannedBarcode] = useState(false);
-  const [pendingScanDecision, setPendingScanDecision] = useState<{
-    existingItem: PantryItemRecord;
-    prefill: PantryItemFormPrefill;
-  } | null>(null);
+  const [quickScanSessionKey, setQuickScanSessionKey] = useState(0);
   const [showAvatarChooser, setShowAvatarChooser] = useState(false);
   const [currentHour, setCurrentHour] = useState(() => new Date().getHours());
   const cameraAvatarInputRef = useRef<HTMLInputElement | null>(null);
   const libraryAvatarInputRef = useRef<HTMLInputElement | null>(null);
-  const quickScanHandledRef = useRef(false);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1229,40 +1231,21 @@ function DashboardScreen({
   }, [activeTab]);
 
   function startQuickScanFlow() {
-    quickScanHandledRef.current = false;
+    setQuickScanSessionKey((current) => current + 1);
     setShowQuickScanModal(true);
   }
 
-  async function handleQuickBarcodeScanned(scannedBarcode: string) {
+  function handleQuickBarcodeScanned(scannedBarcode: string) {
     const normalizedBarcode = scannedBarcode.trim();
 
-    if (!normalizedBarcode || quickScanHandledRef.current) {
+    if (!normalizedBarcode) {
       return;
     }
 
-    quickScanHandledRef.current = true;
     setShowQuickScanModal(false);
-
-    const existingItem =
-      pantryItems.find((item) =>
-        barcodeMatches(normalizedBarcode, getPantryItemBarcode(item.notes)),
-      ) ?? null;
-
-    const prefill: PantryItemFormPrefill = {
+    onOpenCreate({
       barcode: normalizedBarcode,
-      category: existingItem?.category ?? null,
-      name: existingItem?.name ?? null,
-    };
-
-    if (existingItem) {
-      setPendingScanDecision({
-        existingItem,
-        prefill,
-      });
-      return;
-    }
-
-    onOpenCreate(prefill);
+    });
   }
 
   useEffect(() => {
@@ -1678,7 +1661,6 @@ function DashboardScreen({
 
             <button
               className="quick-action quick-action--light"
-              disabled={isResolvingScannedBarcode}
               type="button"
               onClick={startQuickScanFlow}
             >
@@ -1688,9 +1670,7 @@ function DashboardScreen({
               <span className="quick-action__body">
                 <span className="quick-action__label quick-action__label--dark">Barcode Scanner</span>
                 <span className="quick-action__caption quick-action__caption--dark">
-                  {isResolvingScannedBarcode
-                    ? "Checking your pantry and product lookup..."
-                    : "Scan a code and jump into the right item flow"}
+                  Scan a code and continue into the add item flow
                 </span>
                 <span className="quick-action__hint quick-action__hint--dark">
                   Scan <IoArrowForward />
@@ -2254,63 +2234,14 @@ function DashboardScreen({
       {toastMessage ? <div className="toast-card">{toastMessage}</div> : null}
 
       <BarcodeScannerModal
+        key={`dashboard-scan-${quickScanSessionKey}`}
         visible={showQuickScanModal}
         onClose={() => setShowQuickScanModal(false)}
         onDetected={(barcode) => {
-          void handleQuickBarcodeScanned(barcode);
+          setShowQuickScanModal(false);
+          handleQuickBarcodeScanned(barcode);
         }}
       />
-
-      {pendingScanDecision ? (
-        <div className="decision-modal" role="dialog" aria-modal="true">
-          <button
-            aria-label="Close barcode decision"
-            className="decision-modal__backdrop"
-            type="button"
-            onClick={() => setPendingScanDecision(null)}
-          />
-
-          <div className="decision-modal__card">
-            <p className="decision-modal__eyebrow">Barcode Already In Pantry</p>
-            <h3 className="decision-modal__title">{pendingScanDecision.existingItem.name} already exists.</h3>
-            <p className="decision-modal__body">
-              Would you like to create a new item anyway or update the existing pantry record?
-            </p>
-
-            <div className="decision-modal__actions">
-              <button
-                className="secondary-button secondary-button--wide decision-modal__button"
-                type="button"
-                onClick={() => setPendingScanDecision(null)}
-              >
-                Cancel
-              </button>
-              <button
-                className="secondary-button secondary-button--wide decision-modal__button"
-                type="button"
-                onClick={() => {
-                  const { prefill } = pendingScanDecision;
-                  setPendingScanDecision(null);
-                  onOpenCreate(prefill);
-                }}
-              >
-                Create New
-              </button>
-              <button
-                className="submit-button decision-modal__button"
-                type="button"
-                onClick={() => {
-                  const { existingItem } = pendingScanDecision;
-                  setPendingScanDecision(null);
-                  onOpenEdit(existingItem);
-                }}
-              >
-                Update Existing
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
 
       {previewImageItem ? (
         <div className="preview-overlay" role="dialog" aria-modal="true">
@@ -2379,6 +2310,7 @@ function PantryItemFormScreen({
   const [pendingPhotoFile, setPendingPhotoFile] = useState<File | null>(null);
   const [barcodeValue, setBarcodeValue] = useState<string | null>(null);
   const [showBarcodeScanner, setShowBarcodeScanner] = useState(false);
+  const [barcodeScannerSessionKey, setBarcodeScannerSessionKey] = useState(0);
   const [isLookingUpBarcode, setIsLookingUpBarcode] = useState(false);
   const [barcodeLookupMessage, setBarcodeLookupMessage] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
@@ -2728,7 +2660,10 @@ function PantryItemFormScreen({
               <button
                 className="scanner-button"
                 type="button"
-                onClick={() => setShowBarcodeScanner(true)}
+                onClick={() => {
+                  setBarcodeScannerSessionKey((current) => current + 1);
+                  setShowBarcodeScanner(true);
+                }}
               >
                 <IoScanOutline />
                 <span>{barcodeValue ? "Scan Again" : "Scan Barcode"}</span>
@@ -2753,7 +2688,10 @@ function PantryItemFormScreen({
                     <button
                       className="secondary-button secondary-button--wide secondary-button--inline"
                       type="button"
-                      onClick={() => setShowBarcodeScanner(true)}
+                      onClick={() => {
+                        setBarcodeScannerSessionKey((current) => current + 1);
+                        setShowBarcodeScanner(true);
+                      }}
                     >
                       Rescan
                     </button>
@@ -2867,9 +2805,11 @@ function PantryItemFormScreen({
       </div>
 
       <BarcodeScannerModal
+        key={`form-scan-${barcodeScannerSessionKey}`}
         visible={showBarcodeScanner}
         onClose={() => setShowBarcodeScanner(false)}
         onDetected={(barcode) => {
+          setShowBarcodeScanner(false);
           void handleBarcodeDetected(barcode);
         }}
       />
@@ -3557,7 +3497,36 @@ export default function App() {
   const editMatch = location.pathname.match(/^\/item\/([^/]+)\/edit$/);
   const editItemId = editMatch ? decodeURIComponent(editMatch[1]) : null;
   const activeDashboardTab = getDashboardTabFromPath(displayLocation.pathname);
-  const createItemPrefill = location.pathname === "/item/new" ? navigationState?.prefill : undefined;
+  const createItemPrefill = useMemo(() => {
+    if (location.pathname !== "/item/new") {
+      return undefined;
+    }
+
+    const statePrefill = navigationState?.prefill;
+    const searchParams = new URLSearchParams(location.search);
+    const barcode = searchParams.get("barcode");
+    const name = searchParams.get("name");
+    const category = searchParams.get("category");
+
+    const queryPrefill =
+      barcode || name || category
+        ? {
+            barcode,
+            category,
+            name,
+          }
+        : undefined;
+
+    if (!statePrefill && !queryPrefill) {
+      return undefined;
+    }
+
+    return {
+      barcode: queryPrefill?.barcode ?? statePrefill?.barcode ?? null,
+      category: queryPrefill?.category ?? statePrefill?.category ?? null,
+      name: queryPrefill?.name ?? statePrefill?.name ?? null,
+    };
+  }, [location.pathname, location.search, navigationState?.prefill]);
 
   async function handleLogout() {
     if (isSigningOut) {
@@ -3618,7 +3587,7 @@ export default function App() {
   }
 
   function goToCreate(prefill?: PantryItemFormPrefill) {
-    navigate("/item/new", getOverlayNavigateOptions(prefill));
+    navigate(getCreateItemPath(prefill), getOverlayNavigateOptions(prefill));
   }
 
   function goToEdit(item: PantryItemRecord) {
@@ -3761,6 +3730,7 @@ export default function App() {
               <PantryItemFormScreen
                 mode="create"
                 onBack={goHome}
+                prefill={createItemPrefill}
                 onSaved={(message) => {
                   handlePantryItemSaved(message);
                   goHome();

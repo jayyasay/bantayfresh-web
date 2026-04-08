@@ -80,6 +80,24 @@ function getCameraErrorMessage(error: unknown) {
     : "We couldn't start the camera right now. You can enter the barcode below instead.";
 }
 
+function normalizeDetectedBarcodeValue(value: string) {
+  const compactValue = value.replace(/\s+/g, "").trim();
+  if (!compactValue) {
+    return null;
+  }
+
+  const digitOnlyValue = compactValue.replace(/\D/g, "");
+  if (digitOnlyValue.length >= 8 && digitOnlyValue.length <= 14) {
+    return digitOnlyValue;
+  }
+
+  if (/^[A-Za-z0-9-]{8,32}$/.test(compactValue)) {
+    return compactValue;
+  }
+
+  return null;
+}
+
 function drawVariantFrame(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
@@ -301,7 +319,7 @@ export default function BarcodeScannerModal({
   }
 
   function handleResolvedBarcode(value: string) {
-    const normalizedBarcode = value.trim();
+    const normalizedBarcode = normalizeDetectedBarcodeValue(value);
     if (!normalizedBarcode || scanLockRef.current) {
       return;
     }
@@ -309,13 +327,12 @@ export default function BarcodeScannerModal({
     scanLockRef.current = true;
     stopScanner();
     onDetected(normalizedBarcode);
-    onClose();
   }
 
   function scheduleScan(sessionId: number) {
     scanTimerRef.current = window.setTimeout(() => {
       void scanFrame(sessionId);
-    }, 140);
+    }, 180);
   }
 
   async function scanFrame(sessionId: number) {
