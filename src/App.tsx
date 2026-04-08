@@ -26,6 +26,7 @@ import {
   IoNutritionOutline,
   IoPersonCircle,
   IoPersonCircleOutline,
+  IoScanOutline,
   IoSnowOutline,
 } from "react-icons/io5";
 import {
@@ -38,15 +39,22 @@ import {
 } from "react-router-dom";
 
 import BrandMark from "./components/BrandMark";
+import BarcodeScannerModal from "./components/BarcodeScannerModal";
 import {
   createPantryItem,
   bulkCreatePantryItems,
+  composePantryItemNotes,
   deletePantryItem,
+  findPantryItemByBarcode,
+  getBarcodeLookupCandidates,
   getPantryItem,
+  getPantryItemBarcode,
+  getPantryItemDisplayNotes,
   listPantryItems,
   type PantryItemInsert,
   type PantryItemRecord,
   updatePantryItem,
+  upsertBarcodeProductLookup,
   uploadPantryItemPhoto,
 } from "./lib/pantry-items";
 import {
@@ -74,6 +82,11 @@ type ReminderPreferenceKey =
   | "notify_three_days_before_expiry";
 type ParsedBulkRow = PantryItemInsert & {
   previewKey: string;
+};
+type PantryItemFormPrefill = {
+  barcode?: string | null;
+  category?: string | null;
+  name?: string | null;
 };
 
 const CATEGORY_OPTIONS = [
@@ -275,6 +288,17 @@ async function confirmAndDeletePantryItem(
 function trimOptionalValue(value: string) {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function barcodeMatches(scannedBarcode: string, candidateBarcode: string | null) {
+  if (!candidateBarcode) {
+    return false;
+  }
+
+  const scannedCandidates = new Set(getBarcodeLookupCandidates(scannedBarcode));
+  return getBarcodeLookupCandidates(candidateBarcode).some((candidate) =>
+    scannedCandidates.has(candidate),
+  );
 }
 
 function normalizeHeader(header: string) {
@@ -878,7 +902,7 @@ type DashboardScreenProps = {
   isProfileLoading: boolean;
   onLogout: () => void;
   onOpenBulkUpload: () => void;
-  onOpenCreate: () => void;
+  onOpenCreate: (prefill?: PantryItemFormPrefill) => void;
   onOpenEdit: (item: PantryItemRecord) => void;
   onOpenExpired: () => void;
   onProfileUpdated: (profile: ProfileRecord) => void;
@@ -924,10 +948,17 @@ function DashboardScreen({
     null,
   );
   const [isBottomBarHidden, setIsBottomBarHidden] = useState(false);
+  const [showQuickScanModal, setShowQuickScanModal] = useState(false);
+  const [isResolvingScannedBarcode] = useState(false);
+  const [pendingScanDecision, setPendingScanDecision] = useState<{
+    existingItem: PantryItemRecord;
+    prefill: PantryItemFormPrefill;
+  } | null>(null);
   const [showAvatarChooser, setShowAvatarChooser] = useState(false);
   const [currentHour, setCurrentHour] = useState(() => new Date().getHours());
   const cameraAvatarInputRef = useRef<HTMLInputElement | null>(null);
   const libraryAvatarInputRef = useRef<HTMLInputElement | null>(null);
+  const quickScanHandledRef = useRef(false);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1020,6 +1051,8 @@ function DashboardScreen({
 
     return pantryItems.filter((item) => {
       const categoryLabel = item.category?.trim() || "Uncategorized";
+      const barcode = getPantryItemBarcode(item.notes)?.toLowerCase() || "";
+      const displayNotes = getPantryItemDisplayNotes(item.notes)?.toLowerCase() || "";
       const matchesCategory =
         selectedCategoryFilter === "all" || categoryLabel === selectedCategoryFilter;
 
@@ -1034,6 +1067,8 @@ function DashboardScreen({
       return (
         item.name.toLowerCase().includes(query) ||
         item.category?.toLowerCase().includes(query) ||
+        displayNotes.includes(query) ||
+        barcode.includes(query) ||
         item.id.toLowerCase().includes(query)
       );
     });
@@ -1192,6 +1227,43 @@ function DashboardScreen({
       scrollRegionRef.current?.scrollTo({ top: 0, left: 0, behavior: "auto" });
     });
   }, [activeTab]);
+
+  function startQuickScanFlow() {
+    quickScanHandledRef.current = false;
+    setShowQuickScanModal(true);
+  }
+
+  async function handleQuickBarcodeScanned(scannedBarcode: string) {
+    const normalizedBarcode = scannedBarcode.trim();
+
+    if (!normalizedBarcode || quickScanHandledRef.current) {
+      return;
+    }
+
+    quickScanHandledRef.current = true;
+    setShowQuickScanModal(false);
+
+    const existingItem =
+      pantryItems.find((item) =>
+        barcodeMatches(normalizedBarcode, getPantryItemBarcode(item.notes)),
+      ) ?? null;
+
+    const prefill: PantryItemFormPrefill = {
+      barcode: normalizedBarcode,
+      category: existingItem?.category ?? null,
+      name: existingItem?.name ?? null,
+    };
+
+    if (existingItem) {
+      setPendingScanDecision({
+        existingItem,
+        prefill,
+      });
+      return;
+    }
+
+    onOpenCreate(prefill);
+  }
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1553,7 +1625,7 @@ function DashboardScreen({
           <h2 className="section-heading">Quick Actions</h2>
 
           <div className="quick-actions-grid">
-            <button className="quick-action" type="button" onClick={onOpenCreate}>
+            <button className="quick-action" type="button" onClick={() => onOpenCreate()}>
               <span className="quick-action__bubble">
                 <IoNutritionOutline />
               </span>
@@ -1603,6 +1675,28 @@ function DashboardScreen({
                 </span>
               </span>
             </button>
+
+            <button
+              className="quick-action quick-action--light"
+              disabled={isResolvingScannedBarcode}
+              type="button"
+              onClick={startQuickScanFlow}
+            >
+              <span className="quick-action__bubble quick-action__bubble--light">
+                <IoScanOutline />
+              </span>
+              <span className="quick-action__body">
+                <span className="quick-action__label quick-action__label--dark">Barcode Scanner</span>
+                <span className="quick-action__caption quick-action__caption--dark">
+                  {isResolvingScannedBarcode
+                    ? "Checking your pantry and product lookup..."
+                    : "Scan a code and jump into the right item flow"}
+                </span>
+                <span className="quick-action__hint quick-action__hint--dark">
+                  Scan <IoArrowForward />
+                </span>
+              </span>
+            </button>
           </div>
         </section>
 
@@ -1640,8 +1734,8 @@ function DashboardScreen({
           <div>
             <h2 className="section-title">Search Inventory</h2>
             <p className="body-copy body-copy--left">
-              Look up stock by item name, category, or internal code before you edit the next
-              record.
+              Look up stock by item name, category, barcode, or internal code before you edit the
+              next record.
             </p>
           </div>
         </header>
@@ -1649,14 +1743,14 @@ function DashboardScreen({
         <div className="search-shell">
           <input
             className="search-input"
-            placeholder="Search item, category, or code..."
+            placeholder="Search item, category, barcode, or code..."
             type="text"
             value={search}
             onChange={(event) => setSearch(event.target.value)}
           />
         </div>
 
-        <button className="inline-action-card" type="button" onClick={onOpenCreate}>
+        <button className="inline-action-card" type="button" onClick={() => onOpenCreate()}>
           <span className="inline-action-glow" />
           <span className="inline-action-copy">
             <span className="inline-action-title">Add New Item</span>
@@ -1698,100 +1792,104 @@ function DashboardScreen({
             </p>
           </div>
         ) : (
-          filteredItems.map((item) => (
-            <div
-              key={item.id}
-              className="inventory-card-button"
-              role="button"
-              tabIndex={0}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  onOpenEdit(item);
-                }
-              }}
-              onClick={() => onOpenEdit(item)}
-            >
-              <div className="inventory-card">
-                <div className="inventory-row inventory-row--top">
-                  <div className="inventory-media">
-                    {item.photo_url ? (
-                      <button
-                        aria-label={`Preview ${item.name} photo`}
-                        className="inventory-image-button"
-                        type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setPreviewImageItem(item);
-                        }}
-                      >
-                        <img
-                          alt={`${item.name} photo`}
-                          className="inventory-image"
-                          src={item.photo_url}
-                        />
-                      </button>
-                    ) : (
-                      <span className="inventory-fallback">o</span>
-                    )}
-                  </div>
+          filteredItems.map((item) => {
+            const displayNotes = getPantryItemDisplayNotes(item.notes);
 
-                  <div className="inventory-main">
-                    <div>
-                      <p className="eyebrow eyebrow--left">{item.category || "Uncategorized"}</p>
-                      <p className="inventory-name">{item.name}</p>
-                      <p className="inventory-meta">{formatExpiryCopy(item.expiry_date)}</p>
+            return (
+              <div
+                key={item.id}
+                className="inventory-card-button"
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onOpenEdit(item);
+                  }
+                }}
+                onClick={() => onOpenEdit(item)}
+              >
+                <div className="inventory-card">
+                  <div className="inventory-row inventory-row--top">
+                    <div className="inventory-media">
+                      {item.photo_url ? (
+                        <button
+                          aria-label={`Preview ${item.name} photo`}
+                          className="inventory-image-button"
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setPreviewImageItem(item);
+                          }}
+                        >
+                          <img
+                            alt={`${item.name} photo`}
+                            className="inventory-image"
+                            src={item.photo_url}
+                          />
+                        </button>
+                      ) : (
+                        <span className="inventory-fallback">o</span>
+                      )}
                     </div>
 
-                    <div className="quantity-control">
-                      <button
-                        className="quantity-button"
-                        type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void handleQuantityChange(item, -1);
-                        }}
-                      >
-                        -
-                      </button>
-                      <span className="quantity-value">
-                        {updatingQuantityId === item.id ? "Saving..." : `Qty ${item.quantity}`}
+                    <div className="inventory-main">
+                      <div>
+                        <p className="eyebrow eyebrow--left">{item.category || "Uncategorized"}</p>
+                        <p className="inventory-name">{item.name}</p>
+                        <p className="inventory-meta">{formatExpiryCopy(item.expiry_date)}</p>
+                      </div>
+
+                      <div className="quantity-control">
+                        <button
+                          className="quantity-button"
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void handleQuantityChange(item, -1);
+                          }}
+                        >
+                          -
+                        </button>
+                        <span className="quantity-value">
+                          {updatingQuantityId === item.id ? "Saving..." : `Qty ${item.quantity}`}
+                        </span>
+                        <button
+                          className="quantity-button"
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void handleQuantityChange(item, 1);
+                          }}
+                        >
+                          +
+                        </button>
+                      </div>
+
+                      {displayNotes ? <p className="inventory-meta">{displayNotes}</p> : null}
+                    </div>
+
+                    <div className="inventory-actions">
+                      <span className={cn("inventory-badge", `inventory-badge--${getInventoryBadgeTone(item)}`)}>
+                        {getInventoryBadgeCopy(item)}
                       </span>
                       <button
-                        className="quantity-button"
+                        className="delete-chip"
                         type="button"
                         onClick={(event) => {
                           event.stopPropagation();
-                          void handleQuantityChange(item, 1);
+                          void handleDeleteItem(item);
                         }}
                       >
-                        +
+                        {deletingItemId === item.id ? "Deleting..." : "Delete"}
                       </button>
+                      <span className="inventory-link">Edit -&gt;</span>
                     </div>
-
-                    {item.notes?.trim() ? <p className="inventory-meta">{item.notes.trim()}</p> : null}
-                  </div>
-
-                  <div className="inventory-actions">
-                    <span className={cn("inventory-badge", `inventory-badge--${getInventoryBadgeTone(item)}`)}>
-                      {getInventoryBadgeCopy(item)}
-                    </span>
-                    <button
-                      className="delete-chip"
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void handleDeleteItem(item);
-                      }}
-                    >
-                      {deletingItemId === item.id ? "Deleting..." : "Delete"}
-                    </button>
-                    <span className="inventory-link">Edit -&gt;</span>
                   </div>
                 </div>
               </div>
-            </div>
-          ))
+            );
+          })
         )}
       </section>
     );
@@ -1842,62 +1940,66 @@ function DashboardScreen({
             </p>
           </div>
         ) : (
-          upcomingExpiryItems.map((item) => (
-            <div
-              key={item.id}
-              className="inventory-card-button"
-              role="button"
-              tabIndex={0}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  onOpenEdit(item);
-                }
-              }}
-              onClick={() => onOpenEdit(item)}
-            >
-              <div className="inventory-card">
-                <div className="inventory-row inventory-row--top">
-                  <div className="inventory-media">
-                    {item.photo_url ? (
-                      <img alt={`${item.name} photo`} className="inventory-image" src={item.photo_url} />
-                    ) : (
-                      <span className="inventory-fallback">o</span>
-                    )}
-                  </div>
+          upcomingExpiryItems.map((item) => {
+            const displayNotes = getPantryItemDisplayNotes(item.notes);
 
-                  <div className="inventory-main">
-                    <div>
-                      <p className="eyebrow eyebrow--left">{item.category || "Uncategorized"}</p>
-                      <p className="inventory-name">{item.name}</p>
-                      <p className="inventory-meta">
-                        Qty {item.quantity} / {formatExpiryCopy(item.expiry_date)}
-                      </p>
+            return (
+              <div
+                key={item.id}
+                className="inventory-card-button"
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onOpenEdit(item);
+                  }
+                }}
+                onClick={() => onOpenEdit(item)}
+              >
+                <div className="inventory-card">
+                  <div className="inventory-row inventory-row--top">
+                    <div className="inventory-media">
+                      {item.photo_url ? (
+                        <img alt={`${item.name} photo`} className="inventory-image" src={item.photo_url} />
+                      ) : (
+                        <span className="inventory-fallback">o</span>
+                      )}
                     </div>
 
-                    {item.notes?.trim() ? <p className="inventory-meta">{item.notes.trim()}</p> : null}
-                  </div>
+                    <div className="inventory-main">
+                      <div>
+                        <p className="eyebrow eyebrow--left">{item.category || "Uncategorized"}</p>
+                        <p className="inventory-name">{item.name}</p>
+                        <p className="inventory-meta">
+                          Qty {item.quantity} / {formatExpiryCopy(item.expiry_date)}
+                        </p>
+                      </div>
 
-                  <div className="inventory-actions">
-                    <span className={cn("inventory-badge", `inventory-badge--${getInventoryBadgeTone(item)}`)}>
-                      {getInventoryBadgeCopy(item)}
-                    </span>
-                    <button
-                      className="delete-chip"
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void handleDeleteItem(item);
-                      }}
-                    >
-                      {deletingItemId === item.id ? "Deleting..." : "Delete"}
-                    </button>
-                    <span className="inventory-link">Edit -&gt;</span>
+                      {displayNotes ? <p className="inventory-meta">{displayNotes}</p> : null}
+                    </div>
+
+                    <div className="inventory-actions">
+                      <span className={cn("inventory-badge", `inventory-badge--${getInventoryBadgeTone(item)}`)}>
+                        {getInventoryBadgeCopy(item)}
+                      </span>
+                      <button
+                        className="delete-chip"
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleDeleteItem(item);
+                        }}
+                      >
+                        {deletingItemId === item.id ? "Deleting..." : "Delete"}
+                      </button>
+                      <span className="inventory-link">Edit -&gt;</span>
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
-          ))
+            );
+          })
         )}
       </section>
     );
@@ -2151,6 +2253,65 @@ function DashboardScreen({
 
       {toastMessage ? <div className="toast-card">{toastMessage}</div> : null}
 
+      <BarcodeScannerModal
+        visible={showQuickScanModal}
+        onClose={() => setShowQuickScanModal(false)}
+        onDetected={(barcode) => {
+          void handleQuickBarcodeScanned(barcode);
+        }}
+      />
+
+      {pendingScanDecision ? (
+        <div className="decision-modal" role="dialog" aria-modal="true">
+          <button
+            aria-label="Close barcode decision"
+            className="decision-modal__backdrop"
+            type="button"
+            onClick={() => setPendingScanDecision(null)}
+          />
+
+          <div className="decision-modal__card">
+            <p className="decision-modal__eyebrow">Barcode Already In Pantry</p>
+            <h3 className="decision-modal__title">{pendingScanDecision.existingItem.name} already exists.</h3>
+            <p className="decision-modal__body">
+              Would you like to create a new item anyway or update the existing pantry record?
+            </p>
+
+            <div className="decision-modal__actions">
+              <button
+                className="secondary-button secondary-button--wide decision-modal__button"
+                type="button"
+                onClick={() => setPendingScanDecision(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="secondary-button secondary-button--wide decision-modal__button"
+                type="button"
+                onClick={() => {
+                  const { prefill } = pendingScanDecision;
+                  setPendingScanDecision(null);
+                  onOpenCreate(prefill);
+                }}
+              >
+                Create New
+              </button>
+              <button
+                className="submit-button decision-modal__button"
+                type="button"
+                onClick={() => {
+                  const { existingItem } = pendingScanDecision;
+                  setPendingScanDecision(null);
+                  onOpenEdit(existingItem);
+                }}
+              >
+                Update Existing
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {previewImageItem ? (
         <div className="preview-overlay" role="dialog" aria-modal="true">
           <button
@@ -2195,6 +2356,7 @@ type PantryItemFormScreenProps = {
   mode: "create" | "edit";
   onBack: () => void;
   onDeleted?: (message: string) => void;
+  prefill?: PantryItemFormPrefill;
   onSaved: (message: string) => void;
   userId: string;
 };
@@ -2204,15 +2366,21 @@ function PantryItemFormScreen({
   mode,
   onBack,
   onDeleted,
+  prefill,
   onSaved,
   userId,
 }: PantryItemFormScreenProps) {
+  const barcodeLookupCacheRef = useRef<Map<string, PantryItemFormPrefill | null>>(new Map());
   const [itemName, setItemName] = useState("");
   const [selectedCategory, setSelectedCategory] = useState<CategoryValue>("Pantry");
   const [quantity, setQuantity] = useState("1");
   const [expiryDate, setExpiryDate] = useState<string | null>(null);
   const [photoUri, setPhotoUri] = useState<string | null>(null);
   const [pendingPhotoFile, setPendingPhotoFile] = useState<File | null>(null);
+  const [barcodeValue, setBarcodeValue] = useState<string | null>(null);
+  const [showBarcodeScanner, setShowBarcodeScanner] = useState(false);
+  const [isLookingUpBarcode, setIsLookingUpBarcode] = useState(false);
+  const [barcodeLookupMessage, setBarcodeLookupMessage] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
   const [isSavingItem, setIsSavingItem] = useState(false);
   const [isDeletingItem, setIsDeletingItem] = useState(false);
@@ -2233,6 +2401,8 @@ function PantryItemFormScreen({
       setQuantity("1");
       setExpiryDate(null);
       setPhotoUri(null);
+      setBarcodeValue(null);
+      setBarcodeLookupMessage(null);
       setNotes("");
       setPendingPhotoFile(null);
       return;
@@ -2247,9 +2417,41 @@ function PantryItemFormScreen({
     setQuantity(String(initialItem.quantity));
     setExpiryDate(initialItem.expiry_date);
     setPhotoUri(initialItem.photo_url);
-    setNotes(initialItem.notes ?? "");
+    setBarcodeValue(getPantryItemBarcode(initialItem.notes));
+    setBarcodeLookupMessage(null);
+    setNotes(getPantryItemDisplayNotes(initialItem.notes) ?? "");
     setPendingPhotoFile(null);
   }, [initialItem]);
+
+  useEffect(() => {
+    if (mode !== "create" || initialItem) {
+      return;
+    }
+
+    setItemName(prefill?.name ?? "");
+    setSelectedCategory(
+      prefill?.category &&
+        CATEGORY_OPTIONS.some((category) => category.value === prefill.category)
+        ? (prefill.category as CategoryValue)
+        : "Pantry",
+    );
+    setQuantity("1");
+    setExpiryDate(null);
+    setPhotoUri(null);
+    setPendingPhotoFile(null);
+    setNotes("");
+    setBarcodeValue(prefill?.barcode ?? null);
+    setErrorMessage(null);
+    setBarcodeLookupMessage(null);
+
+    if (prefill?.barcode) {
+      if (prefill.name) {
+        setBarcodeLookupMessage(`Matched existing product name: ${prefill.name}.`);
+      } else {
+        void handleBarcodeDetected(prefill.barcode);
+      }
+    }
+  }, [initialItem, mode, prefill]);
 
   useEffect(() => {
     return () => {
@@ -2276,6 +2478,64 @@ function PantryItemFormScreen({
     setPendingPhotoFile(file);
     setErrorMessage(null);
     event.target.value = "";
+  }
+
+  async function handleBarcodeDetected(scannedBarcode: string) {
+    const normalizedBarcode = scannedBarcode.trim();
+    setBarcodeValue(normalizedBarcode);
+    setErrorMessage(null);
+
+    if (!normalizedBarcode) {
+      setBarcodeLookupMessage(null);
+      return;
+    }
+
+    const cachedMatch = barcodeLookupCacheRef.current.get(normalizedBarcode);
+    if (cachedMatch !== undefined) {
+      if (cachedMatch) {
+        setItemName(cachedMatch.name ?? "");
+        if (
+          cachedMatch.category &&
+          CATEGORY_OPTIONS.some((category) => category.value === cachedMatch.category)
+        ) {
+          setSelectedCategory(cachedMatch.category as CategoryValue);
+        }
+        setBarcodeLookupMessage(`Matched existing item: ${cachedMatch.name}.`);
+      } else {
+        setBarcodeLookupMessage("No existing item matched this barcode yet.");
+      }
+      return;
+    }
+
+    try {
+      setIsLookingUpBarcode(true);
+
+      const { data, error } = await findPantryItemByBarcode(normalizedBarcode);
+
+      if (error) {
+        throw error;
+      }
+
+      const matchedItem = data
+        ? {
+            category: null,
+            name: data.product_name,
+          }
+        : null;
+
+      barcodeLookupCacheRef.current.set(normalizedBarcode, matchedItem);
+
+      if (matchedItem) {
+        setItemName(matchedItem.name ?? "");
+        setBarcodeLookupMessage(`Matched existing item: ${matchedItem.name}.`);
+      } else {
+        setBarcodeLookupMessage("No existing item matched this barcode yet.");
+      }
+    } catch {
+      setBarcodeLookupMessage("Barcode captured. We couldn't verify an existing match right now.");
+    } finally {
+      setIsLookingUpBarcode(false);
+    }
   }
 
   async function handleSave() {
@@ -2314,7 +2574,7 @@ function PantryItemFormScreen({
         name: trimmedName,
         category: selectedCategory,
         expiry_date: expiryDate,
-        notes: trimOptionalValue(notes),
+        notes: composePantryItemNotes(trimOptionalValue(notes), barcodeValue),
         photo_url: nextPhotoUrl,
         quantity: parsedQuantity,
         unit: null,
@@ -2327,6 +2587,17 @@ function PantryItemFormScreen({
 
       if (result.error) {
         throw result.error;
+      }
+
+      if (barcodeValue?.trim()) {
+        const { error: barcodeLookupError } = await upsertBarcodeProductLookup(
+          barcodeValue,
+          trimmedName,
+        );
+
+        if (barcodeLookupError) {
+          throw barcodeLookupError;
+        }
       }
 
       onSaved(mode === "edit" ? `${result.data.name} updated.` : `${result.data.name} added.`);
@@ -2453,6 +2724,63 @@ function PantryItemFormScreen({
             </label>
 
             <div className="field-group">
+              <span className="form-label">Barcode</span>
+              <button
+                className="scanner-button"
+                type="button"
+                onClick={() => setShowBarcodeScanner(true)}
+              >
+                <IoScanOutline />
+                <span>{barcodeValue ? "Scan Again" : "Scan Barcode"}</span>
+              </button>
+
+              {barcodeValue ? (
+                <div className="barcode-card">
+                  <div className="barcode-card__copy">
+                    <p className="barcode-card__label">Detected code</p>
+                    <p className="barcode-card__value">{barcodeValue}</p>
+                  </div>
+
+                  {isLookingUpBarcode || barcodeLookupMessage ? (
+                    <p className={cn("barcode-card__message", isLookingUpBarcode && "barcode-card__message--muted")}>
+                      {isLookingUpBarcode
+                        ? "Checking your pantry for an existing match..."
+                        : barcodeLookupMessage}
+                    </p>
+                  ) : null}
+
+                  <div className="inline-button-row">
+                    <button
+                      className="secondary-button secondary-button--wide secondary-button--inline"
+                      type="button"
+                      onClick={() => setShowBarcodeScanner(true)}
+                    >
+                      Rescan
+                    </button>
+                    <button
+                      className="secondary-button secondary-button--wide secondary-button--inline"
+                      type="button"
+                      onClick={() => {
+                        setBarcodeValue(null);
+                        setBarcodeLookupMessage(null);
+                      }}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="inline-notice inline-notice--success">
+                  <p className="inline-notice__title">Camera-powered scanning</p>
+                  <p className="inline-notice__body">
+                    Open the scanner and point the back camera at the product barcode. The app
+                    captures it automatically with no manual code entry.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div className="field-group">
               <span className="form-label">Expiry Date</span>
               <div className="input-shell">
                 <input
@@ -2537,6 +2865,14 @@ function PantryItemFormScreen({
           </div>
         </section>
       </div>
+
+      <BarcodeScannerModal
+        visible={showBarcodeScanner}
+        onClose={() => setShowBarcodeScanner(false)}
+        onDetected={(barcode) => {
+          void handleBarcodeDetected(barcode);
+        }}
+      />
     </div>
   );
 }
@@ -2872,6 +3208,7 @@ function ExpiredItemsScreen({
           ) : (
             expiredItems.map((item) => {
               const expiredDays = getExpiredDays(item.expiry_date);
+              const displayNotes = getPantryItemDisplayNotes(item.notes);
 
               return (
                 <div
@@ -2907,7 +3244,7 @@ function ExpiredItemsScreen({
                         </div>
 
                         <p className="inventory-meta">
-                          {item.notes?.trim() ? item.notes.trim() : `Expired on ${formatExpiryCopy(item.expiry_date)}.`}
+                          {displayNotes ? displayNotes : `Expired on ${formatExpiryCopy(item.expiry_date)}.`}
                         </p>
                       </div>
 
@@ -3052,7 +3389,10 @@ function EditPantryItemRoute({
 export default function App() {
   const location = useLocation();
   const navigate = useNavigate();
-  const navigationState = location.state as { backgroundLocation?: RouterLocation } | null;
+  const navigationState = location.state as {
+    backgroundLocation?: RouterLocation;
+    prefill?: PantryItemFormPrefill;
+  } | null;
   const backgroundLocation =
     navigationState?.backgroundLocation &&
     isDashboardPath(navigationState.backgroundLocation.pathname)
@@ -3217,6 +3557,7 @@ export default function App() {
   const editMatch = location.pathname.match(/^\/item\/([^/]+)\/edit$/);
   const editItemId = editMatch ? decodeURIComponent(editMatch[1]) : null;
   const activeDashboardTab = getDashboardTabFromPath(displayLocation.pathname);
+  const createItemPrefill = location.pathname === "/item/new" ? navigationState?.prefill : undefined;
 
   async function handleLogout() {
     if (isSigningOut) {
@@ -3251,16 +3592,17 @@ export default function App() {
     setProfile(nextProfile);
   }
 
-  function getOverlayNavigateOptions() {
+  function getOverlayNavigateOptions(prefill?: PantryItemFormPrefill) {
     const nextBackgroundLocation =
       backgroundLocation ?? (isDashboardPath(location.pathname) ? location : null);
 
-    if (!nextBackgroundLocation) {
+    if (!nextBackgroundLocation && !prefill) {
       return undefined;
     }
 
     return {
       state: {
+        ...(prefill ? { prefill } : {}),
         backgroundLocation: nextBackgroundLocation,
       },
     };
@@ -3275,8 +3617,8 @@ export default function App() {
     navigate("/");
   }
 
-  function goToCreate() {
-    navigate("/item/new", getOverlayNavigateOptions());
+  function goToCreate(prefill?: PantryItemFormPrefill) {
+    navigate("/item/new", getOverlayNavigateOptions(prefill));
   }
 
   function goToEdit(item: PantryItemRecord) {
@@ -3352,6 +3694,7 @@ export default function App() {
             <PantryItemFormScreen
               mode="create"
               onBack={goHome}
+              prefill={createItemPrefill}
               onSaved={(message) => {
                 handlePantryItemSaved(message);
                 goHome();

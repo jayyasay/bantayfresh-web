@@ -1,5 +1,7 @@
 import { supabase } from "./supabase";
 
+const BARCODE_NOTE_PATTERN = /(?:^|\n)\[barcode\]\s*(.+?)(?=\n|$)/i;
+
 export type PantryItemRecord = {
   id: string;
   user_id: string;
@@ -25,6 +27,16 @@ export type PantryItemInsert = {
 };
 
 export type PantryItemUpdate = Partial<PantryItemInsert>;
+
+export type PantryItemSuggestion = {
+  name: string;
+  category: string | null;
+};
+
+export type BarcodeLookupRecord = {
+  barcode: string;
+  product_name: string;
+};
 
 const PANTRY_ITEM_COLUMNS =
   "id, user_id, name, category, quantity, unit, expiry_date, photo_url, notes, created_at, updated_at";
@@ -55,6 +67,75 @@ function getFileExtension(file: File) {
   }
 
   return "jpg";
+}
+
+export function getPantryItemBarcode(notes: string | null) {
+  const match = notes?.match(BARCODE_NOTE_PATTERN);
+  const barcode = match?.[1]?.trim();
+  return barcode ? barcode : null;
+}
+
+export function getBarcodeLookupCandidates(barcode: string) {
+  const trimmedBarcode = barcode.trim();
+  if (!trimmedBarcode) {
+    return [];
+  }
+
+  const digitsOnlyBarcode = trimmedBarcode.replace(/\D/g, "");
+  const candidates: string[] = [];
+
+  const pushCandidate = (value: string | null | undefined) => {
+    const normalizedValue = value?.trim();
+    if (!normalizedValue || candidates.includes(normalizedValue)) {
+      return;
+    }
+
+    candidates.push(normalizedValue);
+  };
+
+  pushCandidate(trimmedBarcode);
+  if (digitsOnlyBarcode) {
+    pushCandidate(digitsOnlyBarcode);
+  }
+
+  if (digitsOnlyBarcode.length === 12) {
+    pushCandidate(`0${digitsOnlyBarcode}`);
+  }
+
+  if (digitsOnlyBarcode.length === 13 && digitsOnlyBarcode.startsWith("0")) {
+    pushCandidate(digitsOnlyBarcode.slice(1));
+  }
+
+  return candidates;
+}
+
+export function getPantryItemDisplayNotes(notes: string | null) {
+  if (!notes) {
+    return null;
+  }
+
+  const cleaned = notes
+    .replace(BARCODE_NOTE_PATTERN, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+export function composePantryItemNotes(notes: string | null, barcode: string | null) {
+  const trimmedNotes = notes?.trim() || null;
+  const trimmedBarcode = barcode?.trim() || null;
+  const parts = [];
+
+  if (trimmedBarcode) {
+    parts.push(`[barcode] ${trimmedBarcode}`);
+  }
+
+  if (trimmedNotes) {
+    parts.push(trimmedNotes);
+  }
+
+  return parts.length > 0 ? parts.join("\n\n") : null;
 }
 
 export async function listPantryItems(userId: string) {
@@ -142,6 +223,49 @@ export async function updatePantryItem(
     .eq("id", itemId)
     .eq("user_id", userId)
     .select(PANTRY_ITEM_COLUMNS)
+    .single();
+}
+
+export async function findPantryItemByBarcode(barcode: string) {
+  const candidates = getBarcodeLookupCandidates(barcode);
+  if (candidates.length === 0) {
+    return { data: null, error: null };
+  }
+
+  const { data, error } = await requireSupabaseClient()
+    .from("barcode_product_lookup")
+    .select("barcode, product_name")
+    .in("barcode", candidates);
+
+  if (error) {
+    return { data: null, error };
+  }
+
+  const matchedRecord =
+    candidates
+      .map((candidate) => data?.find((record) => record.barcode === candidate) ?? null)
+      .find(Boolean) ?? null;
+
+  return { data: matchedRecord, error: null };
+}
+
+export async function upsertBarcodeProductLookup(barcode: string, productName: string) {
+  const normalizedBarcode = barcode.trim();
+  const normalizedProductName = productName.trim();
+
+  return requireSupabaseClient()
+    .from("barcode_product_lookup")
+    .upsert(
+      {
+        barcode: normalizedBarcode,
+        last_seen_at: new Date().toISOString(),
+        product_name: normalizedProductName,
+      },
+      {
+        onConflict: "barcode",
+      },
+    )
+    .select("barcode, product_name")
     .single();
 }
 
