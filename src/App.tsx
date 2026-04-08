@@ -46,6 +46,7 @@ import {
   composePantryItemNotes,
   deletePantryItem,
   findPantryItemByBarcode,
+  getBarcodeLookupCandidates,
   getPantryItem,
   getPantryItemBarcode,
   getPantryItemDisplayNotes,
@@ -310,6 +311,17 @@ function getCreateItemPath(prefill?: PantryItemFormPrefill) {
 
   const queryString = searchParams.toString();
   return queryString ? `/item/new?${queryString}` : "/item/new";
+}
+
+function pantryBarcodeMatches(scannedBarcode: string, candidateBarcode: string | null) {
+  if (!candidateBarcode) {
+    return false;
+  }
+
+  const scannedCandidates = new Set(getBarcodeLookupCandidates(scannedBarcode));
+  return getBarcodeLookupCandidates(candidateBarcode).some((candidate) =>
+    scannedCandidates.has(candidate),
+  );
 }
 
 function formatCellValue(value: unknown) {
@@ -2287,6 +2299,7 @@ type PantryItemFormScreenProps = {
   mode: "create" | "edit";
   onBack: () => void;
   onDeleted?: (message: string) => void;
+  onOpenExistingItem?: (item: PantryItemRecord) => void;
   prefill?: PantryItemFormPrefill;
   onSaved: (message: string) => void;
   userId: string;
@@ -2297,11 +2310,13 @@ function PantryItemFormScreen({
   mode,
   onBack,
   onDeleted,
+  onOpenExistingItem,
   prefill,
   onSaved,
   userId,
 }: PantryItemFormScreenProps) {
   const barcodeLookupCacheRef = useRef<Map<string, PantryItemFormPrefill | null>>(new Map());
+  const pantryBarcodeCacheRef = useRef<Map<string, PantryItemRecord | null>>(new Map());
   const [itemName, setItemName] = useState("");
   const [selectedCategory, setSelectedCategory] = useState<CategoryValue>("Pantry");
   const [quantity, setQuantity] = useState("1");
@@ -2313,6 +2328,7 @@ function PantryItemFormScreen({
   const [barcodeScannerSessionKey, setBarcodeScannerSessionKey] = useState(0);
   const [isLookingUpBarcode, setIsLookingUpBarcode] = useState(false);
   const [barcodeLookupMessage, setBarcodeLookupMessage] = useState<string | null>(null);
+  const [existingBarcodeItem, setExistingBarcodeItem] = useState<PantryItemRecord | null>(null);
   const [notes, setNotes] = useState("");
   const [isSavingItem, setIsSavingItem] = useState(false);
   const [isDeletingItem, setIsDeletingItem] = useState(false);
@@ -2335,6 +2351,7 @@ function PantryItemFormScreen({
       setPhotoUri(null);
       setBarcodeValue(null);
       setBarcodeLookupMessage(null);
+      setExistingBarcodeItem(null);
       setNotes("");
       setPendingPhotoFile(null);
       return;
@@ -2351,6 +2368,7 @@ function PantryItemFormScreen({
     setPhotoUri(initialItem.photo_url);
     setBarcodeValue(getPantryItemBarcode(initialItem.notes));
     setBarcodeLookupMessage(null);
+    setExistingBarcodeItem(null);
     setNotes(getPantryItemDisplayNotes(initialItem.notes) ?? "");
     setPendingPhotoFile(null);
   }, [initialItem]);
@@ -2375,13 +2393,10 @@ function PantryItemFormScreen({
     setBarcodeValue(prefill?.barcode ?? null);
     setErrorMessage(null);
     setBarcodeLookupMessage(null);
+    setExistingBarcodeItem(null);
 
     if (prefill?.barcode) {
-      if (prefill.name) {
-        setBarcodeLookupMessage(`Matched existing product name: ${prefill.name}.`);
-      } else {
-        void handleBarcodeDetected(prefill.barcode);
-      }
+      void handleBarcodeDetected(prefill.barcode);
     }
   }, [initialItem, mode, prefill]);
 
@@ -2416,10 +2431,39 @@ function PantryItemFormScreen({
     const normalizedBarcode = scannedBarcode.trim();
     setBarcodeValue(normalizedBarcode);
     setErrorMessage(null);
+    setExistingBarcodeItem(null);
 
     if (!normalizedBarcode) {
       setBarcodeLookupMessage(null);
       return;
+    }
+
+    const cachedExistingItem = pantryBarcodeCacheRef.current.get(normalizedBarcode);
+    if (cachedExistingItem !== undefined) {
+      if (cachedExistingItem) {
+        setExistingBarcodeItem(cachedExistingItem);
+      }
+    } else {
+      try {
+        const { data, error } = await listPantryItems(userId);
+
+        if (error) {
+          throw error;
+        }
+
+        const matchedPantryItem =
+          (data ?? []).find((item) =>
+            pantryBarcodeMatches(normalizedBarcode, getPantryItemBarcode(item.notes)),
+          ) ?? null;
+
+        pantryBarcodeCacheRef.current.set(normalizedBarcode, matchedPantryItem);
+
+        if (matchedPantryItem) {
+          setExistingBarcodeItem(matchedPantryItem);
+        }
+      } catch {
+        // Non-fatal: allow the rest of the barcode flow to continue.
+      }
     }
 
     const cachedMatch = barcodeLookupCacheRef.current.get(normalizedBarcode);
@@ -2701,6 +2745,7 @@ function PantryItemFormScreen({
                       onClick={() => {
                         setBarcodeValue(null);
                         setBarcodeLookupMessage(null);
+                        setExistingBarcodeItem(null);
                       }}
                     >
                       Clear
@@ -2813,6 +2858,47 @@ function PantryItemFormScreen({
           void handleBarcodeDetected(barcode);
         }}
       />
+
+      {mode === "create" && existingBarcodeItem ? (
+        <div className="decision-modal" role="dialog" aria-modal="true">
+          <button
+            aria-label="Close barcode decision"
+            className="decision-modal__backdrop"
+            type="button"
+            onClick={() => setExistingBarcodeItem(null)}
+          />
+
+          <div className="decision-modal__card">
+            <p className="decision-modal__eyebrow">Barcode Already In Pantry</p>
+            <h3 className="decision-modal__title">{existingBarcodeItem.name} already exists.</h3>
+            <p className="decision-modal__body">
+              This barcode is already linked to an existing pantry item. Would you like to create
+              a new item anyway or update the existing record?
+            </p>
+
+            <div className="decision-modal__actions">
+              <button
+                className="secondary-button secondary-button--wide decision-modal__button"
+                type="button"
+                onClick={() => setExistingBarcodeItem(null)}
+              >
+                Create New
+              </button>
+              <button
+                className="submit-button decision-modal__button"
+                type="button"
+                onClick={() => {
+                  const itemToEdit = existingBarcodeItem;
+                  setExistingBarcodeItem(null);
+                  onOpenExistingItem?.(itemToEdit);
+                }}
+              >
+                Update Existing
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -3663,6 +3749,7 @@ export default function App() {
             <PantryItemFormScreen
               mode="create"
               onBack={goHome}
+              onOpenExistingItem={goToEdit}
               prefill={createItemPrefill}
               onSaved={(message) => {
                 handlePantryItemSaved(message);
@@ -3730,6 +3817,7 @@ export default function App() {
               <PantryItemFormScreen
                 mode="create"
                 onBack={goHome}
+                onOpenExistingItem={goToEdit}
                 prefill={createItemPrefill}
                 onSaved={(message) => {
                   handlePantryItemSaved(message);
