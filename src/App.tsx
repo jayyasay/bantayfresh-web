@@ -50,6 +50,8 @@ import {
   getPantryItem,
   getPantryItemBarcode,
   getPantryItemDisplayNotes,
+  getPantryItemInventorySpace,
+  getPantryItemIsLowStock,
   listPantryItems,
   type PantryItemInsert,
   type PantryItemRecord,
@@ -57,6 +59,13 @@ import {
   upsertBarcodeProductLookup,
   uploadPantryItemPhoto,
 } from "./lib/pantry-items";
+import {
+  INVENTORY_SPACE_CONFIG,
+  INVENTORY_SPACE_OPTIONS,
+  INVENTORY_SPACE_PALETTES,
+  normalizeInventorySpace,
+  type InventorySpaceKey,
+} from "./lib/inventory-spaces";
 import {
   getOrCreateProfile,
   type ProfileRecord,
@@ -71,7 +80,7 @@ import {
   supabase,
 } from "./lib/supabase";
 
-type TabKey = "home" | "inventory" | "alerts" | "profile";
+type TabKey = "home" | "inventory" | "low_stock" | "alerts" | "profile";
 type AuthMode = "login" | "register";
 type CategoryValue = "Fruits & Veggies" | "Fridge Items" | "Pantry";
 type FieldKey = "email" | "password" | "confirmPassword";
@@ -86,6 +95,7 @@ type ParsedBulkRow = PantryItemInsert & {
 type PantryItemFormPrefill = {
   barcode?: string | null;
   category?: string | null;
+  inventorySpace?: InventorySpaceKey | null;
   name?: string | null;
 };
 
@@ -136,6 +146,7 @@ const DASHBOARD_TAB_PATHS: Record<TabKey, string> = {
   alerts: "/alerts",
   home: "/",
   inventory: "/inventory",
+  low_stock: "/low-stock",
   profile: "/profile",
 };
 
@@ -150,6 +161,10 @@ function getDashboardTabFromPath(pathname: string): TabKey {
 
   if (pathname === "/alerts") {
     return "alerts";
+  }
+
+  if (pathname === "/low-stock") {
+    return "low_stock";
   }
 
   if (pathname === "/profile") {
@@ -309,8 +324,22 @@ function getCreateItemPath(prefill?: PantryItemFormPrefill) {
     searchParams.set("category", prefill.category.trim());
   }
 
+  if (prefill?.inventorySpace) {
+    searchParams.set("space", prefill.inventorySpace);
+  }
+
   const queryString = searchParams.toString();
   return queryString ? `/item/new?${queryString}` : "/item/new";
+}
+
+function getInventorySpacePath(pathname: "/expired" | "/bulk-upload", inventorySpace?: InventorySpaceKey | null) {
+  if (!inventorySpace) {
+    return pathname;
+  }
+
+  const searchParams = new URLSearchParams();
+  searchParams.set("space", inventorySpace);
+  return `${pathname}?${searchParams.toString()}`;
 }
 
 function pantryBarcodeMatches(scannedBarcode: string, candidateBarcode: string | null) {
@@ -920,10 +949,10 @@ type DashboardScreenProps = {
   isLoggingOut: boolean;
   isProfileLoading: boolean;
   onLogout: () => void;
-  onOpenBulkUpload: () => void;
+  onOpenBulkUpload: (inventorySpace: InventorySpaceKey) => void;
   onOpenCreate: (prefill?: PantryItemFormPrefill) => void;
   onOpenEdit: (item: PantryItemRecord) => void;
-  onOpenExpired: () => void;
+  onOpenExpired: (inventorySpace: InventorySpaceKey) => void;
   onProfileUpdated: (profile: ProfileRecord) => void;
   onShowToast: (message: string) => void;
   onTabChange: (tab: TabKey) => void;
@@ -954,6 +983,7 @@ function DashboardScreen({
   userId,
 }: DashboardScreenProps) {
   const scrollRegionRef = useRef<HTMLDivElement | null>(null);
+  const [activeInventorySpace, setActiveInventorySpace] = useState<InventorySpaceKey>("kitchen");
   const [search, setSearch] = useState("");
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState("all");
   const [pantryItems, setPantryItems] = useState<PantryItemRecord[]>([]);
@@ -961,6 +991,7 @@ function DashboardScreen({
   const [inventoryError, setInventoryError] = useState<string | null>(null);
   const [deletingItemId, setDeletingItemId] = useState<string | null>(null);
   const [updatingQuantityId, setUpdatingQuantityId] = useState<string | null>(null);
+  const [updatingLowStockId, setUpdatingLowStockId] = useState<string | null>(null);
   const [previewImageItem, setPreviewImageItem] = useState<PantryItemRecord | null>(null);
   const [isUpdatingAvatar, setIsUpdatingAvatar] = useState(false);
   const [savingPreferenceKey, setSavingPreferenceKey] = useState<"one_day" | "three_days" | null>(
@@ -1025,8 +1056,23 @@ function DashboardScreen({
     };
   }, [refreshToken, userId]);
 
+  useEffect(() => {
+    setSearch("");
+    setSelectedCategoryFilter("all");
+  }, [activeInventorySpace]);
+
+  const activeSpaceItems = useMemo(
+    () =>
+      pantryItems.filter(
+        (item) => getPantryItemInventorySpace(item.notes) === activeInventorySpace,
+      ),
+    [activeInventorySpace, pantryItems],
+  );
+  const activeSpaceConfig = INVENTORY_SPACE_CONFIG[activeInventorySpace];
+  const activeSpacePalette = INVENTORY_SPACE_PALETTES[activeInventorySpace];
+
   const categoryFilters = useMemo(() => {
-    const categoryCounts = pantryItems.reduce<Record<string, number>>((accumulator, item) => {
+    const categoryCounts = activeSpaceItems.reduce<Record<string, number>>((accumulator, item) => {
       const key = item.category?.trim() || "Uncategorized";
       accumulator[key] = (accumulator[key] ?? 0) + 1;
       return accumulator;
@@ -1038,7 +1084,7 @@ function DashboardScreen({
 
     return [
       {
-        count: pantryItems.length,
+        count: activeSpaceItems.length,
         key: "all",
         label: "All",
       },
@@ -1048,7 +1094,7 @@ function DashboardScreen({
         label: category,
       })),
     ];
-  }, [pantryItems]);
+  }, [activeSpaceItems]);
 
   useEffect(() => {
     const filterStillExists = categoryFilters.some((category) => {
@@ -1063,7 +1109,7 @@ function DashboardScreen({
   const filteredItems = useMemo(() => {
     const query = search.trim().toLowerCase();
 
-    return pantryItems.filter((item) => {
+    return activeSpaceItems.filter((item) => {
       const categoryLabel = item.category?.trim() || "Uncategorized";
       const barcode = getPantryItemBarcode(item.notes)?.toLowerCase() || "";
       const displayNotes = getPantryItemDisplayNotes(item.notes)?.toLowerCase() || "";
@@ -1086,21 +1132,22 @@ function DashboardScreen({
         item.id.toLowerCase().includes(query)
       );
     });
-  }, [pantryItems, search, selectedCategoryFilter]);
+  }, [activeSpaceItems, search, selectedCategoryFilter]);
 
-  const upcomingExpiryItems = pantryItems.filter((item) => {
+  const upcomingExpiryItems = activeSpaceItems.filter((item) => {
     return getPantryItemStatus(item.expiry_date) === "expiring_soon";
   });
-  const expiredItems = pantryItems.filter((item) => {
+  const expiredItems = activeSpaceItems.filter((item) => {
     return getPantryItemStatus(item.expiry_date) === "expired";
   });
+  const lowStockItems = activeSpaceItems.filter((item) => getPantryItemIsLowStock(item.notes));
   const nearExpiryCount = upcomingExpiryItems.length;
-  const totalItems = pantryItems.length;
+  const totalItems = activeSpaceItems.length;
   const greetingTimeOfDay = getTimeOfDayGreeting(currentHour);
   const greetingSubtitle =
     nearExpiryCount === 0
-      ? "You are all clear right now. Keep this momentum and your shelves stay fresh."
-      : `You have ${nearExpiryCount} item${nearExpiryCount === 1 ? "" : "s"} entering the 3-day expiry window. Let’s move on them early.`;
+      ? `Your ${activeSpaceConfig.label.toLowerCase()} inventory is clear right now. Keep this momentum and stay ahead of waste.`
+      : `You have ${nearExpiryCount} ${activeSpaceConfig.shortLabel.toLowerCase()} item${nearExpiryCount === 1 ? "" : "s"} entering the 3-day expiry window.`;
   const profileInitial = displayName.trim().charAt(0).toUpperCase() || "B";
   const profileAvatarUrl = profile?.avatar_url?.trim() || null;
   const formattedCreatedAt = formatProfileDate(profile?.created_at ?? null);
@@ -1128,11 +1175,11 @@ function DashboardScreen({
         .map((item) => item.name)
         .join(", ");
 
-    const addedItems = pantryItems
+    const addedItems = activeSpaceItems
       .filter((item) => getTimestamp(item.created_at) >= twentyFourHoursAgo)
       .sort((left, right) => getTimestamp(right.created_at) - getTimestamp(left.created_at));
 
-    const updatedItems = pantryItems
+    const updatedItems = activeSpaceItems
       .filter((item) => {
         const createdAt = getTimestamp(item.created_at);
         const updatedAt = getTimestamp(item.updated_at);
@@ -1140,7 +1187,7 @@ function DashboardScreen({
       })
       .sort((left, right) => getTimestamp(right.updated_at) - getTimestamp(left.updated_at));
 
-    const recentlyExpiredItems = pantryItems
+    const recentlyExpiredItems = activeSpaceItems
       .filter((item) => {
         if (!item.expiry_date) {
           return false;
@@ -1192,7 +1239,7 @@ function DashboardScreen({
     }
 
     return entries.slice(0, 3);
-  }, [pantryItems]);
+  }, [activeSpaceItems]);
 
   const tabs: Array<{
     activeIcon: ReactNode;
@@ -1206,6 +1253,12 @@ function DashboardScreen({
       icon: <IoLayersOutline />,
       key: "inventory",
       label: "Inventory",
+    },
+    {
+      activeIcon: <IoNotifications />,
+      icon: <IoNotificationsOutline />,
+      key: "low_stock",
+      label: "Low Stock",
     },
     {
       activeIcon: <IoNotifications />,
@@ -1228,6 +1281,7 @@ function DashboardScreen({
     return true;
   });
   const shouldSpreadTabs = visibleTabs.length === 4;
+  const shouldCompactTabs = visibleTabs.length > 4;
 
   useEffect(() => {
     if (activeTab === "alerts" && nearExpiryCount === 0) {
@@ -1241,6 +1295,12 @@ function DashboardScreen({
       scrollRegionRef.current?.scrollTo({ top: 0, left: 0, behavior: "auto" });
     });
   }, [activeTab]);
+
+  function startCreateFlow() {
+    onOpenCreate({
+      inventorySpace: activeInventorySpace,
+    });
+  }
 
   function startQuickScanFlow() {
     setQuickScanSessionKey((current) => current + 1);
@@ -1257,6 +1317,7 @@ function DashboardScreen({
     setShowQuickScanModal(false);
     onOpenCreate({
       barcode: normalizedBarcode,
+      inventorySpace: activeInventorySpace,
     });
   }
 
@@ -1352,6 +1413,67 @@ function DashboardScreen({
       );
     } finally {
       setUpdatingQuantityId(null);
+    }
+  }
+
+  async function handleLowStockChange(item: PantryItemRecord, nextValue: boolean) {
+    if (updatingLowStockId) {
+      return;
+    }
+
+    const previousNotes = item.notes;
+    const nextNotes = composePantryItemNotes(
+      getPantryItemDisplayNotes(item.notes),
+      getPantryItemBarcode(item.notes),
+      {
+        inventorySpace: getPantryItemInventorySpace(item.notes),
+        isLowStock: nextValue,
+      },
+    );
+
+    setUpdatingLowStockId(item.id);
+    setPantryItems((currentItems) =>
+      currentItems.map((currentItem) =>
+        currentItem.id === item.id
+          ? {
+              ...currentItem,
+              notes: nextNotes,
+            }
+          : currentItem,
+      ),
+    );
+
+    try {
+      const { data, error } = await updatePantryItem(userId, item.id, {
+        notes: nextNotes,
+      });
+
+      if (error) {
+        throw error;
+      }
+
+      setPantryItems((currentItems) =>
+        currentItems.map((currentItem) => (currentItem.id === item.id ? data : currentItem)),
+      );
+    } catch (error) {
+      setPantryItems((currentItems) =>
+        currentItems.map((currentItem) =>
+          currentItem.id === item.id
+            ? {
+                ...currentItem,
+                notes: previousNotes,
+              }
+            : currentItem,
+        ),
+      );
+
+      window.alert(
+        error instanceof Error
+          ? error.message
+          : "Couldn't update stock status. Please try again.",
+      );
+    } finally {
+      setUpdatingLowStockId(null);
     }
   }
 
@@ -1519,6 +1641,39 @@ function DashboardScreen({
     }
   }
 
+  function renderSpaceTabs() {
+    return (
+      <div className="space-switcher">
+        {INVENTORY_SPACE_OPTIONS.map((space) => {
+          const active = activeInventorySpace === space.key;
+          const palette = INVENTORY_SPACE_PALETTES[space.key];
+
+          return (
+            <button
+              key={space.key}
+              className={cn("space-tab", active && "space-tab--active")}
+              style={{
+                backgroundColor: active ? palette.tabActiveBackground : "var(--surface)",
+                borderColor: active ? palette.accentSoftBorder : "var(--page-line)",
+                color: active ? palette.tabActiveText : "var(--text-dark)",
+              }}
+              type="button"
+              onClick={() => setActiveInventorySpace(space.key)}
+            >
+              <span className="space-tab__label">{space.shortLabel}</span>
+              <span
+                className="space-tab__meta"
+                style={{ color: active ? palette.tabActiveMeta : "var(--text-soft)" }}
+              >
+                {space.label}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+
   function renderOverview() {
     if (isItemsLoading && pantryItems.length === 0) {
       return (
@@ -1580,24 +1735,70 @@ function DashboardScreen({
             </div>
           </div>
 
-          <div className="hero-card">
-            <div className="hero-glow hero-glow--primary" />
-            <div className="hero-glow hero-glow--secondary" />
-            <div className="hero-stripe hero-stripe--one" />
-            <div className="hero-stripe hero-stripe--two" />
+          {renderSpaceTabs()}
+
+          <div
+            className="hero-card"
+            style={{
+              backgroundColor: activeSpacePalette.heroBackground,
+              borderColor: activeSpacePalette.accentSoftBorder,
+            }}
+          >
+            <div
+              className="hero-glow hero-glow--primary"
+              style={{ backgroundColor: activeSpacePalette.glowPrimary }}
+            />
+            <div
+              className="hero-glow hero-glow--secondary"
+              style={{ backgroundColor: activeSpacePalette.glowSecondary }}
+            />
+            <div
+              className="hero-stripe hero-stripe--one"
+              style={{ backgroundColor: activeSpacePalette.heroStripe }}
+            />
+            <div
+              className="hero-stripe hero-stripe--two"
+              style={{ backgroundColor: activeSpacePalette.heroStripe }}
+            />
 
             <div className="hero-bottom">
-              <p className="hero-label">Freshness Snapshot</p>
-              <p className="hero-value">{totalItems} Active Items</p>
-              <p className="hero-meta">
-                Move fast on the soonest-to-expire items first so less stock goes to waste.
+              <p className="hero-label" style={{ color: activeSpacePalette.heroMeta }}>
+                {activeSpaceConfig.label} Snapshot
+              </p>
+              <p className="hero-value" style={{ color: activeSpacePalette.heroText }}>
+                {totalItems} Active Items
+              </p>
+              <p className="hero-meta" style={{ color: activeSpacePalette.heroMeta }}>
+                {lowStockItems.length === 0
+                  ? `Keep your ${activeSpaceConfig.label.toLowerCase()} records current so nothing critical slips through.`
+                  : `${lowStockItems.length} item${lowStockItems.length === 1 ? "" : "s"} are marked low stock in this space.`}
               </p>
               <div className="hero-meta-row">
-                <button className="hero-badge" type="button" onClick={onOpenExpired}>
-                  {expiredItems.length === 0 ? "No expired items, nice!" : `${expiredItems.length} Expired`}
+                <button
+                  className="hero-badge"
+                  style={{
+                    backgroundColor: activeSpacePalette.pillBackground,
+                    borderColor: activeSpacePalette.pillBorder,
+                    color: activeSpacePalette.pillText,
+                  }}
+                  type="button"
+                  onClick={() => onOpenExpired(activeInventorySpace)}
+                >
+                  {expiredItems.length === 0
+                    ? "No expired items, nice!"
+                    : `${expiredItems.length} Expired`}
                 </button>
-                <div className="hero-stat-pill">
-                  {nearExpiryCount === 0 ? "Pantry health is good" : `${nearExpiryCount} Near Expiry`}
+                <div
+                  className="hero-stat-pill"
+                  style={{
+                    backgroundColor: activeSpacePalette.pillBackground,
+                    borderColor: activeSpacePalette.pillBorder,
+                    color: activeSpacePalette.pillText,
+                  }}
+                >
+                  {nearExpiryCount === 0
+                    ? "Pantry health is good"
+                    : `${nearExpiryCount} Near Expiry`}
                 </div>
               </div>
             </div>
@@ -1620,31 +1821,63 @@ function DashboardScreen({
           <h2 className="section-heading">Quick Actions</h2>
 
           <div className="quick-actions-grid">
-            <button className="quick-action" type="button" onClick={() => onOpenCreate()}>
-              <span className="quick-action__bubble">
+            <button
+              className="quick-action"
+              style={{
+                backgroundColor: activeSpacePalette.actionBackground,
+                color: activeSpacePalette.actionText,
+              }}
+              type="button"
+              onClick={startCreateFlow}
+            >
+              <span
+                className="quick-action__bubble"
+                style={{ backgroundColor: activeSpacePalette.accentSurface, color: activeSpacePalette.accent }}
+              >
                 <IoNutritionOutline />
               </span>
               <span className="quick-action__body">
                 <span className="quick-action__label">Add Item</span>
-                <span className="quick-action__caption">Create a new pantry record</span>
-                <span className="quick-action__hint">
+                <span
+                  className="quick-action__caption"
+                  style={{ color: activeSpacePalette.primaryActionMutedText }}
+                >
+                  {activeSpaceConfig.quickActionLabel}
+                </span>
+                <span
+                  className="quick-action__hint"
+                  style={{ color: activeSpacePalette.primaryActionMutedText }}
+                >
                   Tap to Add <IoArrowForward />
                 </span>
               </span>
             </button>
 
             <button
-              className="quick-action quick-action--dark"
+              className="quick-action quick-action--light"
+              style={{
+                backgroundColor: activeSpacePalette.secondaryActionBackground,
+                borderColor: activeSpacePalette.secondaryActionBorder,
+                color: activeSpacePalette.secondaryActionText,
+              }}
               type="button"
               onClick={() => onTabChange("inventory")}
             >
-              <span className="quick-action__bubble">
+              <span
+                className="quick-action__bubble quick-action__bubble--light"
+                style={{
+                  backgroundColor: activeSpacePalette.secondaryActionBubble,
+                  color: activeSpacePalette.accent,
+                }}
+              >
                 <IoLayersOutline />
               </span>
               <span className="quick-action__body">
-                <span className="quick-action__label">View Inventory</span>
-                <span className="quick-action__caption">Scan all active pantry rows</span>
-                <span className="quick-action__hint">
+                <span className="quick-action__label quick-action__label--dark">View Inventory</span>
+                <span className="quick-action__caption quick-action__caption--dark">
+                  Scan all active pantry rows
+                </span>
+                <span className="quick-action__hint quick-action__hint--dark">
                   Open Inventory <IoArrowForward />
                 </span>
               </span>
@@ -1653,9 +1886,15 @@ function DashboardScreen({
             <button
               className="quick-action quick-action--light"
               type="button"
-              onClick={onOpenBulkUpload}
+              onClick={() => onOpenBulkUpload(activeInventorySpace)}
             >
-              <span className="quick-action__bubble quick-action__bubble--light">
+              <span
+                className="quick-action__bubble quick-action__bubble--light"
+                style={{
+                  backgroundColor: activeSpacePalette.accentSurface,
+                  color: activeSpacePalette.accent,
+                }}
+              >
                 <IoCloudUploadOutline />
               </span>
               <span className="quick-action__body">
@@ -1663,9 +1902,12 @@ function DashboardScreen({
                   Bulk Upload
                 </span>
                 <span className="quick-action__caption quick-action__caption--dark">
-                  Import .xls, .xlsx, or .csv files in one flow
+                  Import .xls, .xlsx, or .csv files into {activeSpaceConfig.shortLabel.toLowerCase()}
                 </span>
-                <span className="quick-action__hint quick-action__hint--dark">
+                <span
+                  className="quick-action__hint quick-action__hint--dark"
+                  style={{ color: activeSpacePalette.accent }}
+                >
                   Upload <IoArrowForward />
                 </span>
               </span>
@@ -1676,7 +1918,13 @@ function DashboardScreen({
               type="button"
               onClick={startQuickScanFlow}
             >
-              <span className="quick-action__bubble quick-action__bubble--light">
+              <span
+                className="quick-action__bubble quick-action__bubble--light"
+                style={{
+                  backgroundColor: activeSpacePalette.accentSurface,
+                  color: activeSpacePalette.accent,
+                }}
+              >
                 <IoScanOutline />
               </span>
               <span className="quick-action__body">
@@ -1684,7 +1932,10 @@ function DashboardScreen({
                 <span className="quick-action__caption quick-action__caption--dark">
                   Scan a code and continue into the add item flow
                 </span>
-                <span className="quick-action__hint quick-action__hint--dark">
+                <span
+                  className="quick-action__hint quick-action__hint--dark"
+                  style={{ color: activeSpacePalette.accent }}
+                >
                   Scan <IoArrowForward />
                 </span>
               </span>
@@ -1693,7 +1944,13 @@ function DashboardScreen({
         </section>
 
         {activityEntries.length > 0 ? (
-          <section className="full-bleed-section">
+          <section
+            className="full-bleed-section"
+            style={{
+              backgroundColor: activeSpacePalette.sectionTint,
+              borderColor: activeSpacePalette.sectionTintBorder,
+            }}
+          >
             <h2 className="section-heading">Today&apos;s Activity</h2>
             <p className="body-copy body-copy--left">
               Added, updated, or newly expired items from the last 24 hours.
@@ -1724,10 +1981,11 @@ function DashboardScreen({
       <section className="section section--padded-top">
         <header className="screen-header screen-header--tight">
           <div>
-            <h2 className="section-title">Search Inventory</h2>
+            {renderSpaceTabs()}
+            <h2 className="section-title section-title--spaced">{activeSpaceConfig.label} Inventory</h2>
             <p className="body-copy body-copy--left">
-              Look up stock by item name, category, barcode, or internal code before you edit the
-              next record.
+              Look up stock by item name, category, barcode, or internal code inside this inventory
+              space before you edit the next record.
             </p>
           </div>
         </header>
@@ -1742,12 +2000,29 @@ function DashboardScreen({
           />
         </div>
 
-        <button className="inline-action-card" type="button" onClick={() => onOpenCreate()}>
-          <span className="inline-action-glow" />
+        <button
+          className="inline-action-card"
+          style={{
+            backgroundColor: activeSpacePalette.inlineActionBackground,
+            borderColor: activeSpacePalette.accentSoftBorder,
+            color: activeSpacePalette.inlineActionForeground,
+          }}
+          type="button"
+          onClick={startCreateFlow}
+        >
+          <span
+            className="inline-action-glow"
+            style={{ backgroundColor: activeSpacePalette.glowPrimary }}
+          />
           <span className="inline-action-copy">
-            <span className="inline-action-title">Add New Item</span>
+            <span className="inline-action-title" style={{ color: activeSpacePalette.inlineActionForeground }}>
+              {activeSpaceConfig.quickActionLabel}
+            </span>
           </span>
-          <span className="quick-action__bubble inline-action-bubble">
+          <span
+            className="quick-action__bubble inline-action-bubble"
+            style={{ backgroundColor: activeSpacePalette.accentSurface, color: activeSpacePalette.accent }}
+          >
             <IoAdd />
           </span>
         </button>
@@ -1760,6 +2035,14 @@ function DashboardScreen({
               <button
                 key={category.key}
                 className={cn("filter-chip", active && "filter-chip--active")}
+                style={
+                  active
+                    ? {
+                        backgroundColor: activeSpacePalette.accent,
+                        borderColor: activeSpacePalette.accent,
+                      }
+                    : undefined
+                }
                 type="button"
                 onClick={() => setSelectedCategoryFilter(category.key)}
               >
@@ -1827,7 +2110,9 @@ function DashboardScreen({
 
                     <div className="inventory-main">
                       <div>
-                        <p className="eyebrow eyebrow--left">{item.category || "Uncategorized"}</p>
+                        <p className="eyebrow eyebrow--left" style={{ color: activeSpacePalette.accent }}>
+                          {item.category || "Uncategorized"}
+                        </p>
                         <p className="inventory-name">{item.name}</p>
                         <p className="inventory-meta">{formatExpiryCopy(item.expiry_date)}</p>
                       </div>
@@ -1857,6 +2142,142 @@ function DashboardScreen({
                           +
                         </button>
                       </div>
+
+                      <div>
+                        <button
+                          className={cn(
+                            "stock-chip",
+                            getPantryItemIsLowStock(item.notes) && "stock-chip--active",
+                          )}
+                          disabled={updatingLowStockId === item.id}
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void handleLowStockChange(item, !getPantryItemIsLowStock(item.notes));
+                          }}
+                        >
+                          {updatingLowStockId === item.id
+                            ? "Saving..."
+                            : getPantryItemIsLowStock(item.notes)
+                              ? "Low Stock"
+                              : "Mark Low Stock"}
+                        </button>
+                      </div>
+
+                      {displayNotes ? <p className="inventory-meta">{displayNotes}</p> : null}
+                    </div>
+
+                    <div className="inventory-actions">
+                      <span className={cn("inventory-badge", `inventory-badge--${getInventoryBadgeTone(item)}`)}>
+                        {getInventoryBadgeCopy(item)}
+                      </span>
+                      <button
+                        className="delete-chip"
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleDeleteItem(item);
+                        }}
+                      >
+                        {deletingItemId === item.id ? "Deleting..." : "Delete"}
+                      </button>
+                      <span className="inventory-link">Edit -&gt;</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </section>
+    );
+  }
+
+  function renderLowStockView() {
+    return (
+      <section className="section section--padded-top">
+        <header className="screen-header screen-header--tight">
+          <div>
+            {renderSpaceTabs()}
+            <h2 className="section-title section-title--spaced">{activeSpaceConfig.label} Low Stock</h2>
+            <p className="body-copy body-copy--left">
+              Track the items that need replenishment first, then jump into the full record if you
+              need to adjust expiry, notes, or photos.
+            </p>
+          </div>
+        </header>
+
+        <div className="summary-card summary-card--soft">
+          <p className="summary-card__eyebrow">{activeSpaceConfig.shortLabel} Watchlist</p>
+          <p className="summary-card__value">
+            {lowStockItems.length} {lowStockItems.length === 1 ? "Item" : "Items"}
+          </p>
+          <p className="summary-card__copy">
+            {lowStockItems.length === 0
+              ? `Nothing in ${activeSpaceConfig.shortLabel.toLowerCase()} is marked low stock right now.`
+              : `These ${activeSpaceConfig.shortLabel.toLowerCase()} items are tagged for replenishment.`}
+          </p>
+        </div>
+
+        {isItemsLoading ? (
+          <SkeletonInventoryList count={2} />
+        ) : lowStockItems.length === 0 ? (
+          <div className="empty-card">
+            <h3 className="section-heading">No Low Stock Items</h3>
+            <p className="body-copy body-copy--left">
+              Mark items as low stock from inventory whenever they need restocking.
+            </p>
+          </div>
+        ) : (
+          lowStockItems.map((item) => {
+            const displayNotes = getPantryItemDisplayNotes(item.notes);
+
+            return (
+              <div
+                key={item.id}
+                className="inventory-card-button"
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onOpenEdit(item);
+                  }
+                }}
+                onClick={() => onOpenEdit(item)}
+              >
+                <div className="inventory-card">
+                  <div className="inventory-row inventory-row--top">
+                    <div className="inventory-media">
+                      {item.photo_url ? (
+                        <img alt={`${item.name} photo`} className="inventory-image" src={item.photo_url} />
+                      ) : (
+                        <span className="inventory-fallback">o</span>
+                      )}
+                    </div>
+
+                    <div className="inventory-main">
+                      <div>
+                        <p className="eyebrow eyebrow--left" style={{ color: activeSpacePalette.accent }}>
+                          {item.category || "Uncategorized"}
+                        </p>
+                        <p className="inventory-name">{item.name}</p>
+                        <p className="inventory-meta">
+                          Qty {item.quantity} / {formatExpiryCopy(item.expiry_date)}
+                        </p>
+                      </div>
+
+                      <button
+                        className="stock-chip stock-chip--active"
+                        disabled={updatingLowStockId === item.id}
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleLowStockChange(item, false);
+                        }}
+                      >
+                        {updatingLowStockId === item.id ? "Saving..." : "Marked Low Stock"}
+                      </button>
 
                       {displayNotes ? <p className="inventory-meta">{displayNotes}</p> : null}
                     </div>
@@ -1892,7 +2313,8 @@ function DashboardScreen({
       <section className="section section--padded-top">
         <header className="screen-header screen-header--tight">
           <div>
-            <h2 className="section-title">Upcoming Expiry</h2>
+            {renderSpaceTabs()}
+            <h2 className="section-title section-title--spaced">{activeSpaceConfig.label} Upcoming Expiry</h2>
             <p className="body-copy body-copy--left">
               Review every item that is within 3 days of expiry and prioritize the next moves
               before stock slips.
@@ -1916,7 +2338,11 @@ function DashboardScreen({
               {expiredItems.length} items have already expired. Open the expired queue to delete
               them or review their details.
             </p>
-            <button className="secondary-button secondary-button--compact" type="button" onClick={onOpenExpired}>
+            <button
+              className="secondary-button secondary-button--compact"
+              type="button"
+              onClick={() => onOpenExpired(activeInventorySpace)}
+            >
               Open Expired Queue
             </button>
           </div>
@@ -1961,7 +2387,9 @@ function DashboardScreen({
 
                     <div className="inventory-main">
                       <div>
-                        <p className="eyebrow eyebrow--left">{item.category || "Uncategorized"}</p>
+                        <p className="eyebrow eyebrow--left" style={{ color: activeSpacePalette.accent }}>
+                          {item.category || "Uncategorized"}
+                        </p>
                         <p className="inventory-name">{item.name}</p>
                         <p className="inventory-meta">
                           Qty {item.quantity} / {formatExpiryCopy(item.expiry_date)}
@@ -2190,6 +2618,10 @@ function DashboardScreen({
       return renderInventoryView();
     }
 
+    if (activeTab === "low_stock") {
+      return renderLowStockView();
+    }
+
     if (activeTab === "alerts") {
       return renderAlertsView();
     }
@@ -2207,6 +2639,7 @@ function DashboardScreen({
         className={cn(
           "bottom-bar",
           shouldSpreadTabs && "bottom-bar--spread",
+          shouldCompactTabs && "bottom-bar--compact",
           isBottomBarHidden && "bottom-bar--hidden",
         )}
       >
@@ -2317,13 +2750,16 @@ function PantryItemFormScreen({
 }: PantryItemFormScreenProps) {
   const barcodeLookupCacheRef = useRef<Map<string, PantryItemFormPrefill | null>>(new Map());
   const pantryBarcodeCacheRef = useRef<Map<string, PantryItemRecord | null>>(new Map());
+  const saveButtonRef = useRef<HTMLButtonElement | null>(null);
   const [itemName, setItemName] = useState("");
+  const [inventorySpace, setInventorySpace] = useState<InventorySpaceKey>("kitchen");
   const [selectedCategory, setSelectedCategory] = useState<CategoryValue>("Pantry");
   const [quantity, setQuantity] = useState("1");
   const [expiryDate, setExpiryDate] = useState<string | null>(null);
   const [photoUri, setPhotoUri] = useState<string | null>(null);
   const [pendingPhotoFile, setPendingPhotoFile] = useState<File | null>(null);
   const [barcodeValue, setBarcodeValue] = useState<string | null>(null);
+  const [isLowStock, setIsLowStock] = useState(false);
   const [showBarcodeScanner, setShowBarcodeScanner] = useState(false);
   const [barcodeScannerSessionKey, setBarcodeScannerSessionKey] = useState(0);
   const [isLookingUpBarcode, setIsLookingUpBarcode] = useState(false);
@@ -2333,9 +2769,59 @@ function PantryItemFormScreen({
   const [isSavingItem, setIsSavingItem] = useState(false);
   const [isDeletingItem, setIsDeletingItem] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isStickySaveVisible, setIsStickySaveVisible] = useState(false);
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
   const libraryInputRef = useRef<HTMLInputElement | null>(null);
   const localPreviewRef = useRef<string | null>(null);
+  const activeSpacePalette = INVENTORY_SPACE_PALETTES[inventorySpace];
+  const initialItemSnapshot = useMemo(() => {
+    if (!initialItem) {
+      return null;
+    }
+
+    return {
+      barcode: getPantryItemBarcode(initialItem.notes) ?? "",
+      category: initialItem.category,
+      expiryDate: initialItem.expiry_date ?? "",
+      inventorySpace: getPantryItemInventorySpace(initialItem.notes),
+      isLowStock: getPantryItemIsLowStock(initialItem.notes),
+      itemName: initialItem.name,
+      notes: getPantryItemDisplayNotes(initialItem.notes) ?? "",
+      photoUri: initialItem.photo_url ?? "",
+      quantity: String(initialItem.quantity),
+    };
+  }, [initialItem]);
+  const hasUnsavedChanges = useMemo(() => {
+    if (mode !== "edit" || !initialItemSnapshot) {
+      return false;
+    }
+
+    return (
+      itemName.trim() !== initialItemSnapshot.itemName.trim() ||
+      inventorySpace !== initialItemSnapshot.inventorySpace ||
+      selectedCategory !== initialItemSnapshot.category ||
+      quantity.trim() !== initialItemSnapshot.quantity ||
+      (expiryDate ?? "") !== initialItemSnapshot.expiryDate ||
+      (photoUri ?? "") !== initialItemSnapshot.photoUri ||
+      (barcodeValue ?? "") !== initialItemSnapshot.barcode ||
+      (trimOptionalValue(notes) ?? "") !== initialItemSnapshot.notes ||
+      isLowStock !== initialItemSnapshot.isLowStock ||
+      pendingPhotoFile !== null
+    );
+  }, [
+    barcodeValue,
+    expiryDate,
+    initialItemSnapshot,
+    inventorySpace,
+    isLowStock,
+    itemName,
+    mode,
+    notes,
+    pendingPhotoFile,
+    photoUri,
+    quantity,
+    selectedCategory,
+  ]);
 
   useEffect(() => {
     if (localPreviewRef.current) {
@@ -2345,6 +2831,7 @@ function PantryItemFormScreen({
 
     if (!initialItem) {
       setItemName("");
+      setInventorySpace(prefill?.inventorySpace ?? "kitchen");
       setSelectedCategory("Pantry");
       setQuantity("1");
       setExpiryDate(null);
@@ -2352,6 +2839,7 @@ function PantryItemFormScreen({
       setBarcodeValue(null);
       setBarcodeLookupMessage(null);
       setExistingBarcodeItem(null);
+      setIsLowStock(false);
       setNotes("");
       setPendingPhotoFile(null);
       return;
@@ -2362,6 +2850,7 @@ function PantryItemFormScreen({
       : "Pantry";
 
     setItemName(initialItem.name);
+    setInventorySpace(getPantryItemInventorySpace(initialItem.notes));
     setSelectedCategory(nextCategory);
     setQuantity(String(initialItem.quantity));
     setExpiryDate(initialItem.expiry_date);
@@ -2369,9 +2858,10 @@ function PantryItemFormScreen({
     setBarcodeValue(getPantryItemBarcode(initialItem.notes));
     setBarcodeLookupMessage(null);
     setExistingBarcodeItem(null);
+    setIsLowStock(getPantryItemIsLowStock(initialItem.notes));
     setNotes(getPantryItemDisplayNotes(initialItem.notes) ?? "");
     setPendingPhotoFile(null);
-  }, [initialItem]);
+  }, [initialItem, prefill?.inventorySpace]);
 
   useEffect(() => {
     if (mode !== "create" || initialItem) {
@@ -2379,6 +2869,12 @@ function PantryItemFormScreen({
     }
 
     setItemName(prefill?.name ?? "");
+    setInventorySpace(
+      prefill?.inventorySpace &&
+        INVENTORY_SPACE_OPTIONS.some((option) => option.key === prefill.inventorySpace)
+        ? prefill.inventorySpace
+        : "kitchen",
+    );
     setSelectedCategory(
       prefill?.category &&
         CATEGORY_OPTIONS.some((category) => category.value === prefill.category)
@@ -2391,6 +2887,7 @@ function PantryItemFormScreen({
     setPendingPhotoFile(null);
     setNotes("");
     setBarcodeValue(prefill?.barcode ?? null);
+    setIsLowStock(false);
     setErrorMessage(null);
     setBarcodeLookupMessage(null);
     setExistingBarcodeItem(null);
@@ -2407,6 +2904,33 @@ function PantryItemFormScreen({
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (mode !== "edit" || !hasUnsavedChanges) {
+      setIsStickySaveVisible(false);
+      return;
+    }
+
+    const button = saveButtonRef.current;
+    const scrollRegion = button?.closest(".scroll-region");
+    if (!button || !(scrollRegion instanceof HTMLElement)) {
+      setIsStickySaveVisible(false);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        setIsStickySaveVisible(!entry.isIntersecting);
+      },
+      {
+        root: scrollRegion,
+        threshold: 0.96,
+      },
+    );
+
+    observer.observe(button);
+    return () => observer.disconnect();
+  }, [hasUnsavedChanges, mode]);
 
   function handleSelectFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -2550,7 +3074,10 @@ function PantryItemFormScreen({
         name: trimmedName,
         category: selectedCategory,
         expiry_date: expiryDate,
-        notes: composePantryItemNotes(trimOptionalValue(notes), barcodeValue),
+        notes: composePantryItemNotes(trimOptionalValue(notes), barcodeValue, {
+          inventorySpace,
+          isLowStock,
+        }),
         photo_url: nextPhotoUrl,
         quantity: parsedQuantity,
         unit: null,
@@ -2634,6 +3161,32 @@ function PantryItemFormScreen({
 
           <div className="form-section">
             <div className="field-group">
+              <p className="form-label">Inventory Space</p>
+              <div className="segment-wrap">
+                {INVENTORY_SPACE_OPTIONS.map((space) => {
+                  const active = inventorySpace === space.key;
+                  const palette = INVENTORY_SPACE_PALETTES[space.key];
+
+                  return (
+                    <button
+                      key={space.key}
+                      className={cn("segment-button", active && "segment-button--active")}
+                      style={{
+                        backgroundColor: active ? palette.tabActiveBackground : "transparent",
+                        borderColor: active ? palette.accentSoftBorder : "transparent",
+                        color: active ? palette.tabActiveText : "var(--text-dark)",
+                      }}
+                      type="button"
+                      onClick={() => setInventorySpace(space.key)}
+                    >
+                      {space.shortLabel}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="field-group">
               <p className="form-label">Category</p>
               <div className="category-grid">
                 {CATEGORY_OPTIONS.map((category) => {
@@ -2645,6 +3198,7 @@ function PantryItemFormScreen({
                       className={cn("category-card", selected && "category-card--selected")}
                       style={{
                         backgroundColor: selected ? category.selectedCardColor : category.cardColor,
+                        borderColor: selected ? activeSpacePalette.accent : "transparent",
                       }}
                       type="button"
                       onClick={() => setSelectedCategory(category.value)}
@@ -2700,9 +3254,43 @@ function PantryItemFormScreen({
             </label>
 
             <div className="field-group">
+              <span className="form-label">Stock Status</span>
+              <div className="segment-wrap segment-wrap--two">
+                <button
+                  className={cn("segment-button", !isLowStock && "segment-button--active")}
+                  style={{
+                    backgroundColor: !isLowStock ? "#E8FAF0" : "transparent",
+                    borderColor: !isLowStock ? "#BEE7CD" : "transparent",
+                    color: !isLowStock ? "var(--deep-green)" : "var(--text-dark)",
+                  }}
+                  type="button"
+                  onClick={() => setIsLowStock(false)}
+                >
+                  In Stock
+                </button>
+                <button
+                  className={cn("segment-button", isLowStock && "segment-button--active")}
+                  style={{
+                    backgroundColor: isLowStock ? "#FFE7DF" : "transparent",
+                    borderColor: isLowStock ? "#F0B2A4" : "transparent",
+                    color: isLowStock ? "#B34242" : "var(--text-dark)",
+                  }}
+                  type="button"
+                  onClick={() => setIsLowStock(true)}
+                >
+                  Low Stock
+                </button>
+              </div>
+            </div>
+
+            <div className="field-group">
               <span className="form-label">Barcode</span>
               <button
                 className="scanner-button"
+                style={{
+                  backgroundColor: activeSpacePalette.actionBackground,
+                  color: activeSpacePalette.actionText,
+                }}
                 type="button"
                 onClick={() => {
                   setBarcodeScannerSessionKey((current) => current + 1);
@@ -2831,7 +3419,16 @@ function PantryItemFormScreen({
 
             {errorMessage ? <StatusNotice body={errorMessage} title="Couldn't Continue" tone="danger" /> : null}
 
-            <button className="submit-button" type="button" onClick={handleSave}>
+            <button
+              ref={saveButtonRef}
+              className="submit-button"
+              style={{
+                backgroundColor: activeSpacePalette.actionBackground,
+                color: activeSpacePalette.actionText,
+              }}
+              type="button"
+              onClick={handleSave}
+            >
               {isSavingItem ? "Saving Item..." : mode === "edit" ? "Save Changes" : "Create Item"}
             </button>
 
@@ -2848,6 +3445,22 @@ function PantryItemFormScreen({
           </div>
         </section>
       </div>
+
+      {isStickySaveVisible ? (
+        <div className="sticky-save-bar">
+          <button
+            className="sticky-save-button"
+            style={{
+              backgroundColor: activeSpacePalette.actionBackground,
+              color: activeSpacePalette.actionText,
+            }}
+            type="button"
+            onClick={handleSave}
+          >
+            {isSavingItem ? "Saving Item..." : "Save Changes"}
+          </button>
+        </div>
+      ) : null}
 
       <BarcodeScannerModal
         key={`form-scan-${barcodeScannerSessionKey}`}
@@ -2904,12 +3517,18 @@ function PantryItemFormScreen({
 }
 
 type BulkUploadScreenProps = {
+  inventorySpace: InventorySpaceKey;
   onBack: () => void;
   onImported: (message: string) => void;
   userId: string;
 };
 
-function BulkUploadScreen({ onBack, onImported, userId }: BulkUploadScreenProps) {
+function BulkUploadScreen({
+  inventorySpace,
+  onBack,
+  onImported,
+  userId,
+}: BulkUploadScreenProps) {
   const [fileName, setFileName] = useState<string | null>(null);
   const [parsedRows, setParsedRows] = useState<ParsedBulkRow[]>([]);
   const [issues, setIssues] = useState<string[]>([]);
@@ -2957,7 +3576,13 @@ function BulkUploadScreen({ onBack, onImported, userId }: BulkUploadScreenProps)
       setIsImporting(true);
       setErrorMessage(null);
 
-      const payload: PantryItemInsert[] = parsedRows.map(({ previewKey: _previewKey, ...item }) => item);
+      const payload: PantryItemInsert[] = parsedRows.map(({ previewKey: _previewKey, ...item }) => ({
+        ...item,
+        notes: composePantryItemNotes(item.notes, null, {
+          inventorySpace,
+          isLowStock: false,
+        }),
+      }));
       const { data, error } = await bulkCreatePantryItems(userId, payload);
 
       if (error) {
@@ -2985,10 +3610,10 @@ function BulkUploadScreen({ onBack, onImported, userId }: BulkUploadScreenProps)
               &lt;
             </button>
             <div>
-              <h2 className="section-title">Bulk Upload Inventory</h2>
+              <h2 className="section-title">{INVENTORY_SPACE_CONFIG[inventorySpace].label} Bulk Upload</h2>
               <p className="body-copy body-copy--left">
-                Import an .xls, .xlsx, or .csv file and turn spreadsheet rows into pantry
-                items in one go.
+                Import an .xls, .xlsx, or .csv file and turn spreadsheet rows into{" "}
+                {INVENTORY_SPACE_CONFIG[inventorySpace].label.toLowerCase()} items in one go.
               </p>
             </div>
           </header>
@@ -3101,6 +3726,7 @@ function BulkUploadScreen({ onBack, onImported, userId }: BulkUploadScreenProps)
 }
 
 type ExpiredItemsScreenProps = {
+  inventorySpace: InventorySpaceKey;
   onBack: () => void;
   onItemsChanged: (message: string) => void;
   onOpenEdit: (item: PantryItemRecord) => void;
@@ -3109,6 +3735,7 @@ type ExpiredItemsScreenProps = {
 };
 
 function ExpiredItemsScreen({
+  inventorySpace,
   onBack,
   onItemsChanged,
   onOpenEdit,
@@ -3162,8 +3789,12 @@ function ExpiredItemsScreen({
   }, [refreshToken, userId]);
 
   const expiredItems = useMemo(() => {
-    return pantryItems.filter((item) => getPantryItemStatus(item.expiry_date) === "expired");
-  }, [pantryItems]);
+    return pantryItems.filter(
+      (item) =>
+        getPantryItemStatus(item.expiry_date) === "expired" &&
+        getPantryItemInventorySpace(item.notes) === inventorySpace,
+    );
+  }, [inventorySpace, pantryItems]);
 
   async function handleDeleteItem(item: PantryItemRecord) {
     const { deleted, error } = await confirmAndDeletePantryItem(
@@ -3197,7 +3828,7 @@ function ExpiredItemsScreen({
               &lt;
             </button>
             <div>
-              <h2 className="section-title">Expired Items</h2>
+              <h2 className="section-title">{INVENTORY_SPACE_CONFIG[inventorySpace].label} Expired Items</h2>
               <p className="body-copy body-copy--left">
                 Review products that have already passed their expiry date, then either delete
                 them or open the full item details.
@@ -3206,7 +3837,7 @@ function ExpiredItemsScreen({
           </header>
 
           <div className="summary-card">
-            <p className="summary-card__eyebrow">Expired Inventory</p>
+            <p className="summary-card__eyebrow">{INVENTORY_SPACE_CONFIG[inventorySpace].shortLabel} Queue</p>
             <p className="summary-card__value">
               {expiredItems.length} {expiredItems.length === 1 ? "Item" : "Items"}
             </p>
@@ -3227,7 +3858,7 @@ function ExpiredItemsScreen({
             <div className="empty-card">
               <h3 className="section-heading">No Expired Items</h3>
               <p className="body-copy body-copy--left">
-                Everything currently in your pantry is still active or inside the upcoming expiry
+                Everything in this inventory space is still active or inside the upcoming expiry
                 window.
               </p>
             </div>
@@ -3583,6 +4214,10 @@ export default function App() {
   const editMatch = location.pathname.match(/^\/item\/([^/]+)\/edit$/);
   const editItemId = editMatch ? decodeURIComponent(editMatch[1]) : null;
   const activeDashboardTab = getDashboardTabFromPath(displayLocation.pathname);
+  const routeInventorySpace = useMemo(() => {
+    const searchParams = new URLSearchParams(location.search);
+    return normalizeInventorySpace(searchParams.get("space")) ?? "kitchen";
+  }, [location.search]);
   const createItemPrefill = useMemo(() => {
     if (location.pathname !== "/item/new") {
       return undefined;
@@ -3593,12 +4228,14 @@ export default function App() {
     const barcode = searchParams.get("barcode");
     const name = searchParams.get("name");
     const category = searchParams.get("category");
+    const inventorySpace = normalizeInventorySpace(searchParams.get("space"));
 
     const queryPrefill =
-      barcode || name || category
+      barcode || name || category || inventorySpace
         ? {
             barcode,
             category,
+            inventorySpace,
             name,
           }
         : undefined;
@@ -3610,6 +4247,7 @@ export default function App() {
     return {
       barcode: queryPrefill?.barcode ?? statePrefill?.barcode ?? null,
       category: queryPrefill?.category ?? statePrefill?.category ?? null,
+      inventorySpace: queryPrefill?.inventorySpace ?? statePrefill?.inventorySpace ?? null,
       name: queryPrefill?.name ?? statePrefill?.name ?? null,
     };
   }, [location.pathname, location.search, navigationState?.prefill]);
@@ -3680,12 +4318,12 @@ export default function App() {
     navigate(`/item/${encodeURIComponent(item.id)}/edit`, getOverlayNavigateOptions());
   }
 
-  function goToExpired() {
-    navigate("/expired", getOverlayNavigateOptions());
+  function goToExpired(inventorySpace?: InventorySpaceKey) {
+    navigate(getInventorySpacePath("/expired", inventorySpace), getOverlayNavigateOptions());
   }
 
-  function goToBulkUpload() {
-    navigate("/bulk-upload", getOverlayNavigateOptions());
+  function goToBulkUpload(inventorySpace?: InventorySpaceKey) {
+    navigate(getInventorySpacePath("/bulk-upload", inventorySpace), getOverlayNavigateOptions());
   }
 
   function goToDashboardTab(tab: TabKey) {
@@ -3741,6 +4379,7 @@ export default function App() {
       <Routes location={displayLocation}>
         <Route path="/" element={renderDashboardRoute(activeDashboardTab)} />
         <Route path="/inventory" element={renderDashboardRoute(activeDashboardTab)} />
+        <Route path="/low-stock" element={renderDashboardRoute(activeDashboardTab)} />
         <Route path="/alerts" element={renderDashboardRoute(activeDashboardTab)} />
         <Route path="/profile" element={renderDashboardRoute(activeDashboardTab)} />
         <Route
@@ -3785,6 +4424,7 @@ export default function App() {
           path="/expired"
           element={
             <ExpiredItemsScreen
+              inventorySpace={routeInventorySpace}
               onBack={goHome}
               onItemsChanged={handlePantryItemsChanged}
               onOpenEdit={goToEdit}
@@ -3797,6 +4437,7 @@ export default function App() {
           path="/bulk-upload"
           element={
             <BulkUploadScreen
+              inventorySpace={routeInventorySpace}
               onBack={goHome}
               onImported={(message) => {
                 handlePantryItemSaved(message);
@@ -3853,6 +4494,7 @@ export default function App() {
             path="/expired"
             element={renderOverlay(
               <ExpiredItemsScreen
+                inventorySpace={routeInventorySpace}
                 onBack={goHome}
                 onItemsChanged={handlePantryItemsChanged}
                 onOpenEdit={goToEdit}
@@ -3865,6 +4507,7 @@ export default function App() {
             path="/bulk-upload"
             element={renderOverlay(
               <BulkUploadScreen
+                inventorySpace={routeInventorySpace}
                 onBack={goHome}
                 onImported={(message) => {
                   handlePantryItemSaved(message);

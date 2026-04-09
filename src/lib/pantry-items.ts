@@ -1,6 +1,12 @@
 import { supabase } from "./supabase";
+import {
+  type InventorySpaceKey,
+  normalizeInventorySpace,
+} from "./inventory-spaces";
 
 const BARCODE_NOTE_PATTERN = /(?:^|\n)\[barcode\]\s*(.+?)(?=\n|$)/i;
+const INVENTORY_SPACE_NOTE_PATTERN = /(?:^|\n)\[space\]\s*(.+?)(?=\n|$)/i;
+const LOW_STOCK_NOTE_PATTERN = /(?:^|\n)\[low_stock\]\s*(.+?)(?=\n|$)/i;
 
 export type PantryItemRecord = {
   id: string;
@@ -75,6 +81,18 @@ export function getPantryItemBarcode(notes: string | null) {
   return barcode ? barcode : null;
 }
 
+export function getPantryItemInventorySpace(notes: string | null): InventorySpaceKey {
+  const match = notes?.match(INVENTORY_SPACE_NOTE_PATTERN);
+  return normalizeInventorySpace(match?.[1]) ?? "kitchen";
+}
+
+export function getPantryItemIsLowStock(notes: string | null) {
+  const match = notes?.match(LOW_STOCK_NOTE_PATTERN);
+  const normalizedValue = match?.[1]?.trim().toLowerCase();
+
+  return normalizedValue === "true" || normalizedValue === "yes" || normalizedValue === "1";
+}
+
 export function getBarcodeLookupCandidates(barcode: string) {
   const trimmedBarcode = barcode.trim();
   if (!trimmedBarcode) {
@@ -116,20 +134,33 @@ export function getPantryItemDisplayNotes(notes: string | null) {
 
   const cleaned = notes
     .replace(BARCODE_NOTE_PATTERN, "")
+    .replace(INVENTORY_SPACE_NOTE_PATTERN, "")
+    .replace(LOW_STOCK_NOTE_PATTERN, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
   return cleaned.length > 0 ? cleaned : null;
 }
 
-export function composePantryItemNotes(notes: string | null, barcode: string | null) {
+export function composePantryItemNotes(
+  notes: string | null,
+  barcode: string | null,
+  metadata?: {
+    inventorySpace?: InventorySpaceKey | null;
+    isLowStock?: boolean;
+  },
+) {
   const trimmedNotes = notes?.trim() || null;
   const trimmedBarcode = barcode?.trim() || null;
   const parts = [];
+  const inventorySpace = metadata?.inventorySpace ?? "kitchen";
 
   if (trimmedBarcode) {
     parts.push(`[barcode] ${trimmedBarcode}`);
   }
+
+  parts.push(`[space] ${inventorySpace}`);
+  parts.push(`[low_stock] ${metadata?.isLowStock ? "true" : "false"}`);
 
   if (trimmedNotes) {
     parts.push(trimmedNotes);
