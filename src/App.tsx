@@ -40,6 +40,8 @@ import {
 
 import BrandMark from "./components/BrandMark";
 import BarcodeScannerModal from "./components/BarcodeScannerModal";
+import DataDeletionPage from "./pages/DataDeletionPage";
+import PrivacyPolicyPage from "./pages/PrivacyPolicyPage";
 import {
   createPantryItem,
   bulkCreatePantryItems,
@@ -156,8 +158,14 @@ const DASHBOARD_TAB_PATHS: Record<TabKey, string> = {
   profile: "/profile",
 };
 
+const PUBLIC_LEGAL_PATHS = new Set(["/privacy-policy", "/data-deletion"]);
+
 function isDashboardPath(pathname: string) {
   return Object.values(DASHBOARD_TAB_PATHS).includes(pathname);
+}
+
+function isPublicLegalPath(pathname: string) {
+  return PUBLIC_LEGAL_PATHS.has(pathname);
 }
 
 function getDashboardTabFromPath(pathname: string): TabKey {
@@ -4349,6 +4357,7 @@ export default function App() {
   const [dashboardToastMessage, setDashboardToastMessage] = useState<string | null>(null);
   const hasAlertedAuthError = useRef(false);
   const hasAlertedProfileError = useRef(false);
+  const isPublicLegalRoute = isPublicLegalPath(location.pathname);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -4409,7 +4418,9 @@ export default function App() {
       if (!nextSession) {
         setDashboardToastMessage(null);
         setProfile(null);
-        navigate("/", { replace: true });
+        if (!isPublicLegalPath(window.location.pathname)) {
+          navigate("/", { replace: true });
+        }
       }
     });
 
@@ -4646,6 +4657,16 @@ export default function App() {
       <div key={location.key} className="route-overlay">
         {children}
       </div>
+    );
+  }
+
+  if (isPublicLegalRoute) {
+    return (
+      <Routes>
+        <Route path="/privacy-policy" element={<PrivacyPolicyPage />} />
+        <Route path="/data-deletion" element={<DataDeletionPage />} />
+        <Route path="*" element={<Navigate replace to="/privacy-policy" />} />
+      </Routes>
     );
   }
 
