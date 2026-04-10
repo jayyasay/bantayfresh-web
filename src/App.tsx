@@ -55,6 +55,7 @@ import {
   listPantryItems,
   type PantryItemInsert,
   type PantryItemRecord,
+  type PantryStockStatus,
   updatePantryItem,
   upsertBarcodeProductLookup,
   uploadPantryItemPhoto,
@@ -87,7 +88,9 @@ type FieldKey = "email" | "password" | "confirmPassword";
 type FieldErrors = Partial<Record<FieldKey, string>>;
 type PantryItemStatus = "expired" | "expiring_soon" | "safe";
 type ReminderPreferenceKey =
+  | "notify_fifteen_days_before_expiry"
   | "notify_one_day_before_expiry"
+  | "notify_thirty_days_before_expiry"
   | "notify_three_days_before_expiry";
 type ParsedBulkRow = PantryItemInsert & {
   previewKey: string;
@@ -134,12 +137,15 @@ const CATEGORY_OPTIONS = [
 }>;
 
 const EXPECTED_FIELDS = [
+  "barcode",
   "category",
   "name",
   "quantity",
   "expiry_date",
   "notes",
   "photo_url",
+  "space",
+  "stock_status",
 ] as const;
 
 const DASHBOARD_TAB_PATHS: Record<TabKey, string> = {
@@ -398,9 +404,26 @@ function parseExpiryDate(value: unknown, xlsx: typeof import("xlsx")) {
   return parsed.toISOString().slice(0, 10);
 }
 
+function parseStockStatus(value: unknown) {
+  const normalized = formatCellValue(value).toLowerCase();
+  if (
+    normalized === "low_stock" ||
+    normalized === "low stock" ||
+    normalized === "low" ||
+    normalized === "yes" ||
+    normalized === "true" ||
+    normalized === "1"
+  ) {
+    return "low_stock" as const;
+  }
+
+  return "in_stock" as const;
+}
+
 function parseWorkbookRows(
   workbook: import("xlsx").WorkBook,
   xlsx: typeof import("xlsx"),
+  inventorySpace: InventorySpaceKey,
 ) {
   const firstSheetName = workbook.SheetNames[0];
   const firstSheet = workbook.Sheets[firstSheetName];
@@ -426,6 +449,11 @@ function parseWorkbookRows(
       row.expiry_date || row.expiry || row.expiration_date,
       xlsx,
     );
+    const space = normalizeInventorySpace(formatCellValue(row.space) || inventorySpace);
+    const barcode = formatCellValue(row.barcode) || null;
+    const stockStatus = parseStockStatus(
+      row.stock_status || row.stock || row.low_stock || row.is_low_stock,
+    );
     const notes = formatCellValue(row.notes) || null;
     const photoUrl = formatCellValue(row.photo_url) || null;
     const rowLabel = `Row ${index + 2}`;
@@ -445,6 +473,7 @@ function parseWorkbookRows(
     }
 
     parsedRows.push({
+      barcode,
       category,
       expiry_date: expiryDate,
       name,
@@ -452,6 +481,8 @@ function parseWorkbookRows(
       photo_url: photoUrl,
       previewKey: `${rowLabel}-${name}`,
       quantity,
+      space: space ?? inventorySpace,
+      stock_status: stockStatus,
       unit: null,
     });
   });
@@ -587,6 +618,8 @@ function getTimeOfDayGreeting(hour: number) {
 
   return "Evening";
 }
+
+const PAGE_SIZE = 20;
 
 function StatusNotice({
   title,
@@ -986,6 +1019,12 @@ function DashboardScreen({
   const [activeInventorySpace, setActiveInventorySpace] = useState<InventorySpaceKey>("kitchen");
   const [search, setSearch] = useState("");
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState("all");
+  const [inventoryVisibleCount, setInventoryVisibleCount] = useState(PAGE_SIZE);
+  const [alertsVisibleCount, setAlertsVisibleCount] = useState(PAGE_SIZE);
+  const [lowStockVisibleCount, setLowStockVisibleCount] = useState(PAGE_SIZE);
+  const [loadingMoreTarget, setLoadingMoreTarget] = useState<
+    "inventory" | "alerts" | "low_stock" | null
+  >(null);
   const [pantryItems, setPantryItems] = useState<PantryItemRecord[]>([]);
   const [isItemsLoading, setIsItemsLoading] = useState(true);
   const [inventoryError, setInventoryError] = useState<string | null>(null);
@@ -994,9 +1033,9 @@ function DashboardScreen({
   const [updatingLowStockId, setUpdatingLowStockId] = useState<string | null>(null);
   const [previewImageItem, setPreviewImageItem] = useState<PantryItemRecord | null>(null);
   const [isUpdatingAvatar, setIsUpdatingAvatar] = useState(false);
-  const [savingPreferenceKey, setSavingPreferenceKey] = useState<"one_day" | "three_days" | null>(
-    null,
-  );
+  const [savingPreferenceKey, setSavingPreferenceKey] = useState<
+    "one_day" | "three_days" | "fifteen_days" | "thirty_days" | null
+  >(null);
   const [isBottomBarHidden, setIsBottomBarHidden] = useState(false);
   const [showQuickScanModal, setShowQuickScanModal] = useState(false);
   const [quickScanSessionKey, setQuickScanSessionKey] = useState(0);
@@ -1004,6 +1043,8 @@ function DashboardScreen({
   const [currentHour, setCurrentHour] = useState(() => new Date().getHours());
   const cameraAvatarInputRef = useRef<HTMLInputElement | null>(null);
   const libraryAvatarInputRef = useRef<HTMLInputElement | null>(null);
+  const loadMoreTimerRef = useRef<number | null>(null);
+  const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1012,6 +1053,14 @@ function DashboardScreen({
 
     return () => {
       window.clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (loadMoreTimerRef.current !== null) {
+        window.clearTimeout(loadMoreTimerRef.current);
+      }
     };
   }, []);
 
@@ -1059,12 +1108,16 @@ function DashboardScreen({
   useEffect(() => {
     setSearch("");
     setSelectedCategoryFilter("all");
+    setInventoryVisibleCount(PAGE_SIZE);
+    setAlertsVisibleCount(PAGE_SIZE);
+    setLowStockVisibleCount(PAGE_SIZE);
+    cancelLoadMoreTimer();
   }, [activeInventorySpace]);
 
   const activeSpaceItems = useMemo(
     () =>
       pantryItems.filter(
-        (item) => getPantryItemInventorySpace(item.notes) === activeInventorySpace,
+        (item) => getPantryItemInventorySpace(item) === activeInventorySpace,
       ),
     [activeInventorySpace, pantryItems],
   );
@@ -1111,8 +1164,8 @@ function DashboardScreen({
 
     return activeSpaceItems.filter((item) => {
       const categoryLabel = item.category?.trim() || "Uncategorized";
-      const barcode = getPantryItemBarcode(item.notes)?.toLowerCase() || "";
-      const displayNotes = getPantryItemDisplayNotes(item.notes)?.toLowerCase() || "";
+      const barcode = getPantryItemBarcode(item)?.toLowerCase() || "";
+      const displayNotes = getPantryItemDisplayNotes(item)?.toLowerCase() || "";
       const matchesCategory =
         selectedCategoryFilter === "all" || categoryLabel === selectedCategoryFilter;
 
@@ -1140,7 +1193,23 @@ function DashboardScreen({
   const expiredItems = activeSpaceItems.filter((item) => {
     return getPantryItemStatus(item.expiry_date) === "expired";
   });
-  const lowStockItems = activeSpaceItems.filter((item) => getPantryItemIsLowStock(item.notes));
+  const lowStockItems = activeSpaceItems.filter((item) => getPantryItemIsLowStock(item));
+
+  useEffect(() => {
+    if (search.trim().length > 0) {
+      setInventoryVisibleCount(filteredItems.length);
+      setAlertsVisibleCount(upcomingExpiryItems.length);
+      setLowStockVisibleCount(lowStockItems.length);
+      cancelLoadMoreTimer();
+      return;
+    }
+
+    setInventoryVisibleCount(PAGE_SIZE);
+    setAlertsVisibleCount(PAGE_SIZE);
+    setLowStockVisibleCount(PAGE_SIZE);
+    cancelLoadMoreTimer();
+  }, [filteredItems.length, lowStockItems.length, search, upcomingExpiryItems.length]);
+
   const nearExpiryCount = upcomingExpiryItems.length;
   const totalItems = activeSpaceItems.length;
   const greetingTimeOfDay = getTimeOfDayGreeting(currentHour);
@@ -1154,8 +1223,12 @@ function DashboardScreen({
   const formattedUpdatedAt = formatProfileDate(profile?.updated_at ?? null);
   const profileSupportsReminderSettings = profile
     ? Object.prototype.hasOwnProperty.call(profile, "notify_three_days_before_expiry") &&
-      Object.prototype.hasOwnProperty.call(profile, "notify_one_day_before_expiry")
+      Object.prototype.hasOwnProperty.call(profile, "notify_one_day_before_expiry") &&
+      Object.prototype.hasOwnProperty.call(profile, "notify_fifteen_days_before_expiry") &&
+      Object.prototype.hasOwnProperty.call(profile, "notify_thirty_days_before_expiry")
     : false;
+  const notifyThirtyDaysBeforeExpiry = profile?.notify_thirty_days_before_expiry !== false;
+  const notifyFifteenDaysBeforeExpiry = profile?.notify_fifteen_days_before_expiry !== false;
   const notifyThreeDaysBeforeExpiry = profile?.notify_three_days_before_expiry !== false;
   const notifyOneDayBeforeExpiry = profile?.notify_one_day_before_expiry !== false;
   const activityEntries = useMemo(() => {
@@ -1321,6 +1394,46 @@ function DashboardScreen({
     });
   }
 
+  function cancelLoadMoreTimer() {
+    if (loadMoreTimerRef.current !== null) {
+      window.clearTimeout(loadMoreTimerRef.current);
+      loadMoreTimerRef.current = null;
+    }
+
+    setLoadingMoreTarget(null);
+  }
+
+  function scheduleLoadMore(target: "inventory" | "alerts" | "low_stock", updateCount: () => void) {
+    if (loadingMoreTarget !== null) {
+      return;
+    }
+
+    setLoadingMoreTarget(target);
+
+    if (loadMoreTimerRef.current !== null) {
+      window.clearTimeout(loadMoreTimerRef.current);
+    }
+
+    loadMoreTimerRef.current = window.setTimeout(() => {
+      updateCount();
+      loadMoreTimerRef.current = null;
+      setLoadingMoreTarget(null);
+    }, 360);
+  }
+
+  function renderLoadMoreFooter(target: "inventory" | "alerts" | "low_stock") {
+    if (loadingMoreTarget !== target) {
+      return null;
+    }
+
+    return (
+      <div className="load-more-footer">
+        <div className="load-more-spinner" />
+        <p className="load-more-text">Loading more items...</p>
+      </div>
+    );
+  }
+
   useEffect(() => {
     if (typeof window === "undefined") {
       return undefined;
@@ -1359,6 +1472,86 @@ function DashboardScreen({
       window.removeEventListener("resize", updateBottomBarVisibility);
     };
   }, []);
+
+  const activeLoadMoreTarget = useMemo<"inventory" | "alerts" | "low_stock" | null>(() => {
+    if (search.trim().length > 0) {
+      return null;
+    }
+
+    if (activeTab === "inventory" && inventoryVisibleCount < filteredItems.length) {
+      return "inventory";
+    }
+
+    if (activeTab === "alerts" && alertsVisibleCount < upcomingExpiryItems.length) {
+      return "alerts";
+    }
+
+    if (activeTab === "low_stock" && lowStockVisibleCount < lowStockItems.length) {
+      return "low_stock";
+    }
+
+    return null;
+  }, [
+    activeTab,
+    alertsVisibleCount,
+    filteredItems.length,
+    inventoryVisibleCount,
+    lowStockItems.length,
+    lowStockVisibleCount,
+    search,
+    upcomingExpiryItems.length,
+  ]);
+
+  useEffect(() => {
+    const root = scrollRegionRef.current;
+    const sentinel = loadMoreSentinelRef.current;
+
+    if (!root || !sentinel || !activeLoadMoreTarget) {
+      return undefined;
+    }
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry?.isIntersecting) {
+          return;
+        }
+
+        if (activeLoadMoreTarget === "inventory") {
+          const nextLimit = filteredItems.length;
+          scheduleLoadMore("inventory", () => {
+            setInventoryVisibleCount((current) => Math.min(current + PAGE_SIZE, nextLimit));
+          });
+          return;
+        }
+
+        if (activeLoadMoreTarget === "alerts") {
+          const nextLimit = upcomingExpiryItems.length;
+          scheduleLoadMore("alerts", () => {
+            setAlertsVisibleCount((current) => Math.min(current + PAGE_SIZE, nextLimit));
+          });
+          return;
+        }
+
+        const nextLimit = lowStockItems.length;
+        scheduleLoadMore("low_stock", () => {
+          setLowStockVisibleCount((current) => Math.min(current + PAGE_SIZE, nextLimit));
+        });
+      },
+      {
+        root,
+        rootMargin: "0px 0px 320px 0px",
+        threshold: 0,
+      },
+    );
+
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [
+    activeLoadMoreTarget,
+    filteredItems.length,
+    lowStockItems.length,
+    upcomingExpiryItems.length,
+  ]);
 
   async function handleQuantityChange(item: PantryItemRecord, delta: number) {
     if (updatingQuantityId) {
@@ -1422,14 +1615,8 @@ function DashboardScreen({
     }
 
     const previousNotes = item.notes;
-    const nextNotes = composePantryItemNotes(
-      getPantryItemDisplayNotes(item.notes),
-      getPantryItemBarcode(item.notes),
-      {
-        inventorySpace: getPantryItemInventorySpace(item.notes),
-        isLowStock: nextValue,
-      },
-    );
+    const previousStockStatus = item.stock_status;
+    const nextNotes = composePantryItemNotes(getPantryItemDisplayNotes(item), null);
 
     setUpdatingLowStockId(item.id);
     setPantryItems((currentItems) =>
@@ -1438,6 +1625,7 @@ function DashboardScreen({
           ? {
               ...currentItem,
               notes: nextNotes,
+              stock_status: nextValue ? "low_stock" : "in_stock",
             }
           : currentItem,
       ),
@@ -1446,6 +1634,7 @@ function DashboardScreen({
     try {
       const { data, error } = await updatePantryItem(userId, item.id, {
         notes: nextNotes,
+        stock_status: nextValue ? "low_stock" : "in_stock",
       });
 
       if (error) {
@@ -1462,6 +1651,7 @@ function DashboardScreen({
             ? {
                 ...currentItem,
                 notes: previousNotes,
+                stock_status: previousStockStatus,
               }
             : currentItem,
         ),
@@ -1589,11 +1779,22 @@ function DashboardScreen({
       return;
     }
 
-    const savingKey = key === "notify_one_day_before_expiry" ? "one_day" : "three_days";
+    const savingKey =
+      key === "notify_one_day_before_expiry"
+        ? "one_day"
+        : key === "notify_three_days_before_expiry"
+          ? "three_days"
+          : key === "notify_fifteen_days_before_expiry"
+            ? "fifteen_days"
+            : "thirty_days";
     const previousValue =
       key === "notify_one_day_before_expiry"
         ? notifyOneDayBeforeExpiry
-        : notifyThreeDaysBeforeExpiry;
+        : key === "notify_three_days_before_expiry"
+          ? notifyThreeDaysBeforeExpiry
+          : key === "notify_fifteen_days_before_expiry"
+            ? notifyFifteenDaysBeforeExpiry
+            : notifyThirtyDaysBeforeExpiry;
 
     setSavingPreferenceKey(savingKey);
     onProfileUpdated({
@@ -1607,7 +1808,10 @@ function DashboardScreen({
       } as Partial<
         Pick<
           ProfileRecord,
-          "notify_one_day_before_expiry" | "notify_three_days_before_expiry"
+          | "notify_one_day_before_expiry"
+          | "notify_three_days_before_expiry"
+          | "notify_fifteen_days_before_expiry"
+          | "notify_thirty_days_before_expiry"
         >
       >;
       const { data, error } = await updateProfile(userId, patch);
@@ -1734,6 +1938,42 @@ function DashboardScreen({
               </button>
             </div>
           </div>
+
+          <button
+            className="inline-action-card"
+            style={{
+              backgroundColor: activeSpacePalette.inlineActionBackground,
+              borderColor: activeSpacePalette.accentSoftBorder,
+              color: activeSpacePalette.inlineActionForeground,
+            }}
+            type="button"
+            onClick={startQuickScanFlow}
+          >
+            <span
+              className="inline-action-glow"
+              style={{ backgroundColor: activeSpacePalette.glowPrimary }}
+            />
+            <span className="inline-action-copy">
+              <span
+                className="inline-action-title"
+                style={{ color: activeSpacePalette.inlineActionForeground }}
+              >
+                Scan Barcode
+              </span>
+              <span
+                className="quick-action__caption"
+                style={{ color: activeSpacePalette.primaryActionMutedText }}
+              >
+                Use the camera to jump straight into add or update.
+              </span>
+            </span>
+            <span
+              className="quick-action__bubble inline-action-bubble"
+              style={{ backgroundColor: activeSpacePalette.accentSurface, color: activeSpacePalette.accent }}
+            >
+              <IoScanOutline />
+            </span>
+          </button>
 
           {renderSpaceTabs()}
 
@@ -1913,33 +2153,6 @@ function DashboardScreen({
               </span>
             </button>
 
-            <button
-              className="quick-action quick-action--light"
-              type="button"
-              onClick={startQuickScanFlow}
-            >
-              <span
-                className="quick-action__bubble quick-action__bubble--light"
-                style={{
-                  backgroundColor: activeSpacePalette.accentSurface,
-                  color: activeSpacePalette.accent,
-                }}
-              >
-                <IoScanOutline />
-              </span>
-              <span className="quick-action__body">
-                <span className="quick-action__label quick-action__label--dark">Barcode Scanner</span>
-                <span className="quick-action__caption quick-action__caption--dark">
-                  Scan a code and continue into the add item flow
-                </span>
-                <span
-                  className="quick-action__hint quick-action__hint--dark"
-                  style={{ color: activeSpacePalette.accent }}
-                >
-                  Scan <IoArrowForward />
-                </span>
-              </span>
-            </button>
           </div>
         </section>
 
@@ -2067,8 +2280,8 @@ function DashboardScreen({
             </p>
           </div>
         ) : (
-          filteredItems.map((item) => {
-            const displayNotes = getPantryItemDisplayNotes(item.notes);
+          filteredItems.slice(0, inventoryVisibleCount).map((item) => {
+            const displayNotes = getPantryItemDisplayNotes(item);
 
             return (
               <div
@@ -2147,18 +2360,18 @@ function DashboardScreen({
                         <button
                           className={cn(
                             "stock-chip",
-                            getPantryItemIsLowStock(item.notes) && "stock-chip--active",
+                            getPantryItemIsLowStock(item) && "stock-chip--active",
                           )}
                           disabled={updatingLowStockId === item.id}
                           type="button"
                           onClick={(event) => {
                             event.stopPropagation();
-                            void handleLowStockChange(item, !getPantryItemIsLowStock(item.notes));
+                            void handleLowStockChange(item, !getPantryItemIsLowStock(item));
                           }}
                         >
                           {updatingLowStockId === item.id
                             ? "Saving..."
-                            : getPantryItemIsLowStock(item.notes)
+                            : getPantryItemIsLowStock(item)
                               ? "Low Stock"
                               : "Mark Low Stock"}
                         </button>
@@ -2189,6 +2402,7 @@ function DashboardScreen({
             );
           })
         )}
+        {renderLoadMoreFooter("inventory")}
       </section>
     );
   }
@@ -2229,8 +2443,8 @@ function DashboardScreen({
             </p>
           </div>
         ) : (
-          lowStockItems.map((item) => {
-            const displayNotes = getPantryItemDisplayNotes(item.notes);
+          lowStockItems.slice(0, lowStockVisibleCount).map((item) => {
+            const displayNotes = getPantryItemDisplayNotes(item);
 
             return (
               <div
@@ -2304,6 +2518,7 @@ function DashboardScreen({
             );
           })
         )}
+        {renderLoadMoreFooter("low_stock")}
       </section>
     );
   }
@@ -2358,8 +2573,8 @@ function DashboardScreen({
             </p>
           </div>
         ) : (
-          upcomingExpiryItems.map((item) => {
-            const displayNotes = getPantryItemDisplayNotes(item.notes);
+          upcomingExpiryItems.slice(0, alertsVisibleCount).map((item) => {
+            const displayNotes = getPantryItemDisplayNotes(item);
 
             return (
               <div
@@ -2421,6 +2636,7 @@ function DashboardScreen({
             );
           })
         )}
+        {renderLoadMoreFooter("alerts")}
       </section>
     );
   }
@@ -2523,6 +2739,70 @@ function DashboardScreen({
           />
 
           <div className="settings-card">
+            <div className="setting-row">
+              <div className="setting-copy">
+                <p className="setting-title">Notify me 30 days before expiry</p>
+                <p className="setting-body">
+                  Get an early reminder when an item enters the 30-day window.
+                </p>
+              </div>
+
+              <button
+                aria-checked={notifyThirtyDaysBeforeExpiry}
+                className={cn(
+                  "switch",
+                  notifyThirtyDaysBeforeExpiry && "switch--active",
+                  (!profileSupportsReminderSettings || savingPreferenceKey !== null) &&
+                    "switch--disabled",
+                )}
+                disabled={!profileSupportsReminderSettings || savingPreferenceKey !== null}
+                role="switch"
+                type="button"
+                onClick={() =>
+                  void handleNotificationPreferenceChange(
+                    "notify_thirty_days_before_expiry",
+                    !notifyThirtyDaysBeforeExpiry,
+                  )
+                }
+              >
+                <span className="switch__thumb" />
+              </button>
+            </div>
+
+            <div className="settings-divider" />
+
+            <div className="setting-row">
+              <div className="setting-copy">
+                <p className="setting-title">Notify me 15 days before expiry</p>
+                <p className="setting-body">
+                  Get a mid-range reminder when an item enters the 15-day window.
+                </p>
+              </div>
+
+              <button
+                aria-checked={notifyFifteenDaysBeforeExpiry}
+                className={cn(
+                  "switch",
+                  notifyFifteenDaysBeforeExpiry && "switch--active",
+                  (!profileSupportsReminderSettings || savingPreferenceKey !== null) &&
+                    "switch--disabled",
+                )}
+                disabled={!profileSupportsReminderSettings || savingPreferenceKey !== null}
+                role="switch"
+                type="button"
+                onClick={() =>
+                  void handleNotificationPreferenceChange(
+                    "notify_fifteen_days_before_expiry",
+                    !notifyFifteenDaysBeforeExpiry,
+                  )
+                }
+              >
+                <span className="switch__thumb" />
+              </button>
+            </div>
+
+            <div className="settings-divider" />
+
             <div className="setting-row">
               <div className="setting-copy">
                 <p className="setting-title">Notify me 3 days before expiry</p>
@@ -2633,6 +2913,7 @@ function DashboardScreen({
     <div className="dashboard-shell">
       <div ref={scrollRegionRef} className="scroll-region">
         {renderContent()}
+        {activeLoadMoreTarget ? <div ref={loadMoreSentinelRef} className="load-more-sentinel" /> : null}
       </div>
 
       <nav
@@ -2646,7 +2927,8 @@ function DashboardScreen({
         {visibleTabs.map((tab) => {
           const active = tab.key === activeTab;
           const isAlertsTab = tab.key === "alerts";
-          const badgeCount = isAlertsTab ? nearExpiryCount : 0;
+          const isLowStockTab = tab.key === "low_stock";
+          const badgeCount = isAlertsTab ? nearExpiryCount : isLowStockTab ? lowStockItems.length : 0;
 
           return (
             <button
@@ -2656,6 +2938,8 @@ function DashboardScreen({
                 active && "bottom-tab--active",
                 isAlertsTab && "bottom-tab--alerts",
                 isAlertsTab && active && "bottom-tab--alerts-active",
+                isLowStockTab && "bottom-tab--low-stock",
+                isLowStockTab && active && "bottom-tab--low-stock-active",
               )}
               type="button"
               onClick={() => onTabChange(tab.key)}
@@ -2780,13 +3064,13 @@ function PantryItemFormScreen({
     }
 
     return {
-      barcode: getPantryItemBarcode(initialItem.notes) ?? "",
+      barcode: getPantryItemBarcode(initialItem) ?? "",
       category: initialItem.category,
       expiryDate: initialItem.expiry_date ?? "",
-      inventorySpace: getPantryItemInventorySpace(initialItem.notes),
-      isLowStock: getPantryItemIsLowStock(initialItem.notes),
+      inventorySpace: getPantryItemInventorySpace(initialItem),
+      isLowStock: getPantryItemIsLowStock(initialItem),
       itemName: initialItem.name,
-      notes: getPantryItemDisplayNotes(initialItem.notes) ?? "",
+      notes: getPantryItemDisplayNotes(initialItem) ?? "",
       photoUri: initialItem.photo_url ?? "",
       quantity: String(initialItem.quantity),
     };
@@ -2850,16 +3134,16 @@ function PantryItemFormScreen({
       : "Pantry";
 
     setItemName(initialItem.name);
-    setInventorySpace(getPantryItemInventorySpace(initialItem.notes));
+    setInventorySpace(getPantryItemInventorySpace(initialItem));
     setSelectedCategory(nextCategory);
     setQuantity(String(initialItem.quantity));
     setExpiryDate(initialItem.expiry_date);
     setPhotoUri(initialItem.photo_url);
-    setBarcodeValue(getPantryItemBarcode(initialItem.notes));
+    setBarcodeValue(getPantryItemBarcode(initialItem));
     setBarcodeLookupMessage(null);
     setExistingBarcodeItem(null);
-    setIsLowStock(getPantryItemIsLowStock(initialItem.notes));
-    setNotes(getPantryItemDisplayNotes(initialItem.notes) ?? "");
+    setIsLowStock(getPantryItemIsLowStock(initialItem));
+    setNotes(getPantryItemDisplayNotes(initialItem) ?? "");
     setPendingPhotoFile(null);
   }, [initialItem, prefill?.inventorySpace]);
 
@@ -2977,7 +3261,7 @@ function PantryItemFormScreen({
 
         const matchedPantryItem =
           (data ?? []).find((item) =>
-            pantryBarcodeMatches(normalizedBarcode, getPantryItemBarcode(item.notes)),
+            pantryBarcodeMatches(normalizedBarcode, getPantryItemBarcode(item)),
           ) ?? null;
 
         pantryBarcodeCacheRef.current.set(normalizedBarcode, matchedPantryItem);
@@ -3071,15 +3355,15 @@ function PantryItemFormScreen({
       }
 
       const payload = {
+        barcode: barcodeValue?.trim() || null,
         name: trimmedName,
         category: selectedCategory,
         expiry_date: expiryDate,
-        notes: composePantryItemNotes(trimOptionalValue(notes), barcodeValue, {
-          inventorySpace,
-          isLowStock,
-        }),
+        notes: composePantryItemNotes(trimOptionalValue(notes), null),
         photo_url: nextPhotoUrl,
         quantity: parsedQuantity,
+        space: inventorySpace,
+        stock_status: (isLowStock ? "low_stock" : "in_stock") as PantryStockStatus,
         unit: null,
       };
 
@@ -3549,7 +3833,7 @@ function BulkUploadScreen({
       const xlsx = await import("xlsx");
       const arrayBuffer = await file.arrayBuffer();
       const workbook = xlsx.read(arrayBuffer, { type: "array" });
-      const parsed = parseWorkbookRows(workbook, xlsx);
+      const parsed = parseWorkbookRows(workbook, xlsx, inventorySpace);
 
       setFileName(file.name || "Selected spreadsheet");
       setIssues(parsed.issues);
@@ -3578,10 +3862,9 @@ function BulkUploadScreen({
 
       const payload: PantryItemInsert[] = parsedRows.map(({ previewKey: _previewKey, ...item }) => ({
         ...item,
-        notes: composePantryItemNotes(item.notes, null, {
-          inventorySpace,
-          isLowStock: false,
-        }),
+        notes: composePantryItemNotes(item.notes, null),
+        space: item.space ?? inventorySpace,
+        stock_status: item.stock_status ?? "in_stock",
       }));
       const { data, error } = await bulkCreatePantryItems(userId, payload);
 
@@ -3792,7 +4075,7 @@ function ExpiredItemsScreen({
     return pantryItems.filter(
       (item) =>
         getPantryItemStatus(item.expiry_date) === "expired" &&
-        getPantryItemInventorySpace(item.notes) === inventorySpace,
+        getPantryItemInventorySpace(item) === inventorySpace,
     );
   }, [inventorySpace, pantryItems]);
 
@@ -3865,7 +4148,7 @@ function ExpiredItemsScreen({
           ) : (
             expiredItems.map((item) => {
               const expiredDays = getExpiredDays(item.expiry_date);
-              const displayNotes = getPantryItemDisplayNotes(item.notes);
+              const displayNotes = getPantryItemDisplayNotes(item);
 
               return (
                 <div

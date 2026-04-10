@@ -11,24 +11,30 @@ const LOW_STOCK_NOTE_PATTERN = /(?:^|\n)\[low_stock\]\s*(.+?)(?=\n|$)/i;
 export type PantryItemRecord = {
   id: string;
   user_id: string;
+  barcode: string | null;
   name: string;
   category: string | null;
   quantity: number;
   unit: string | null;
   expiry_date: string | null;
   photo_url: string | null;
+  space: InventorySpaceKey | null;
+  stock_status: PantryStockStatus | null;
   notes: string | null;
   created_at: string;
   updated_at: string;
 };
 
 export type PantryItemInsert = {
+  barcode?: string | null;
   name: string;
   category: string | null;
   quantity: number;
   unit: string | null;
   expiry_date: string | null;
   photo_url: string | null;
+  space?: InventorySpaceKey | null;
+  stock_status?: PantryStockStatus | null;
   notes: string | null;
 };
 
@@ -44,8 +50,21 @@ export type BarcodeLookupRecord = {
   product_name: string;
 };
 
+export type PantryStockStatus = "in_stock" | "low_stock";
+
+type PantryItemNotesSource =
+  | string
+  | {
+      barcode?: string | null;
+      notes?: string | null;
+      space?: string | null;
+      stock_status?: string | null;
+    }
+  | null
+  | undefined;
+
 const PANTRY_ITEM_COLUMNS =
-  "id, user_id, name, category, quantity, unit, expiry_date, photo_url, notes, created_at, updated_at";
+  "id, user_id, barcode, name, category, quantity, unit, expiry_date, photo_url, space, stock_status, notes, created_at, updated_at";
 
 const SUPABASE_CONFIGURATION_ERROR =
   "Supabase is not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY to web/.env and restart the app.";
@@ -75,18 +94,50 @@ function getFileExtension(file: File) {
   return "jpg";
 }
 
-export function getPantryItemBarcode(notes: string | null) {
+function getSourceNotes(value: PantryItemNotesSource) {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  return value?.notes ?? null;
+}
+
+export function normalizePantryItemStockStatus(
+  value: string | null | undefined,
+): PantryStockStatus {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "low_stock" || normalized === "low stock"
+    ? "low_stock"
+    : "in_stock";
+}
+
+export function getPantryItemBarcode(value: PantryItemNotesSource) {
+  if (typeof value !== "string" && value?.barcode?.trim()) {
+    return value.barcode.trim();
+  }
+
+  const notes = getSourceNotes(value);
   const match = notes?.match(BARCODE_NOTE_PATTERN);
   const barcode = match?.[1]?.trim();
   return barcode ? barcode : null;
 }
 
-export function getPantryItemInventorySpace(notes: string | null): InventorySpaceKey {
+export function getPantryItemInventorySpace(value: PantryItemNotesSource): InventorySpaceKey {
+  if (typeof value !== "string" && value?.space) {
+    return normalizeInventorySpace(value.space) ?? "kitchen";
+  }
+
+  const notes = getSourceNotes(value);
   const match = notes?.match(INVENTORY_SPACE_NOTE_PATTERN);
   return normalizeInventorySpace(match?.[1]) ?? "kitchen";
 }
 
-export function getPantryItemIsLowStock(notes: string | null) {
+export function getPantryItemIsLowStock(value: PantryItemNotesSource) {
+  if (typeof value !== "string" && typeof value?.stock_status === "string") {
+    return normalizePantryItemStockStatus(value.stock_status) === "low_stock";
+  }
+
+  const notes = getSourceNotes(value);
   const match = notes?.match(LOW_STOCK_NOTE_PATTERN);
   const normalizedValue = match?.[1]?.trim().toLowerCase();
 
@@ -127,7 +178,8 @@ export function getBarcodeLookupCandidates(barcode: string) {
   return candidates;
 }
 
-export function getPantryItemDisplayNotes(notes: string | null) {
+export function getPantryItemDisplayNotes(value: PantryItemNotesSource) {
+  const notes = getSourceNotes(value);
   if (!notes) {
     return null;
   }
@@ -144,29 +196,14 @@ export function getPantryItemDisplayNotes(notes: string | null) {
 
 export function composePantryItemNotes(
   notes: string | null,
-  barcode: string | null,
-  metadata?: {
+  _barcode: string | null,
+  _metadata?: {
     inventorySpace?: InventorySpaceKey | null;
     isLowStock?: boolean;
   },
 ) {
   const trimmedNotes = notes?.trim() || null;
-  const trimmedBarcode = barcode?.trim() || null;
-  const parts = [];
-  const inventorySpace = metadata?.inventorySpace ?? "kitchen";
-
-  if (trimmedBarcode) {
-    parts.push(`[barcode] ${trimmedBarcode}`);
-  }
-
-  parts.push(`[space] ${inventorySpace}`);
-  parts.push(`[low_stock] ${metadata?.isLowStock ? "true" : "false"}`);
-
-  if (trimmedNotes) {
-    parts.push(trimmedNotes);
-  }
-
-  return parts.length > 0 ? parts.join("\n\n") : null;
+  return trimmedNotes;
 }
 
 export async function listPantryItems(userId: string) {
@@ -192,7 +229,16 @@ export async function createPantryItem(userId: string, item: PantryItemInsert) {
     .from("pantry_items")
     .insert({
       user_id: userId,
-      ...item,
+      barcode: item.barcode?.trim() || null,
+      name: item.name,
+      category: item.category,
+      quantity: item.quantity,
+      unit: item.unit,
+      expiry_date: item.expiry_date,
+      photo_url: item.photo_url,
+      space: item.space ?? "kitchen",
+      stock_status: normalizePantryItemStockStatus(item.stock_status),
+      notes: item.notes?.trim() || null,
     })
     .select(PANTRY_ITEM_COLUMNS)
     .single();
@@ -204,7 +250,16 @@ export async function bulkCreatePantryItems(userId: string, items: PantryItemIns
     .insert(
       items.map((item) => ({
         user_id: userId,
-        ...item,
+        barcode: item.barcode?.trim() || null,
+        name: item.name,
+        category: item.category,
+        quantity: item.quantity,
+        unit: item.unit,
+        expiry_date: item.expiry_date,
+        photo_url: item.photo_url,
+        space: item.space ?? "kitchen",
+        stock_status: normalizePantryItemStockStatus(item.stock_status),
+        notes: item.notes?.trim() || null,
       })),
     )
     .select(PANTRY_ITEM_COLUMNS);
@@ -245,10 +300,30 @@ export async function updatePantryItem(
   itemId: string,
   item: PantryItemUpdate,
 ) {
+  const patch: PantryItemUpdate = {
+    ...item,
+  };
+
+  if (item.barcode !== undefined) {
+    patch.barcode = item.barcode?.trim() || null;
+  }
+
+  if (item.space !== undefined) {
+    patch.space = item.space ?? "kitchen";
+  }
+
+  if (item.stock_status !== undefined) {
+    patch.stock_status = normalizePantryItemStockStatus(item.stock_status);
+  }
+
+  if (item.notes !== undefined) {
+    patch.notes = item.notes?.trim() || null;
+  }
+
   return requireSupabaseClient()
     .from("pantry_items")
     .update({
-      ...item,
+      ...patch,
       user_id: userId,
     })
     .eq("id", itemId)

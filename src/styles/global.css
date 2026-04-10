@@ -25,6 +25,16 @@
   --radius-sm: 14px;
 }
 
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 * {
   box-sizing: border-box;
 }
@@ -654,6 +664,37 @@ textarea:focus-visible,
 .activity-copy {
   display: grid;
   gap: 2px;
+}
+
+.load-more-footer {
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 12px 0 8px;
+}
+
+.load-more-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(11, 123, 68, 0.18);
+  border-top-color: var(--deep-green);
+  border-radius: 999px;
+  animation: spin 0.8s linear infinite;
+}
+
+.load-more-text {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 0.88rem;
+  line-height: 1.35;
+  font-weight: 700;
+}
+
+.load-more-sentinel {
+  width: 100%;
+  height: 1px;
 }
 
 .activity-title,
@@ -1480,9 +1521,20 @@ textarea:focus-visible,
   color: #ffd8cc;
 }
 
+.bottom-tab--low-stock {
+  border: 1px solid rgba(242, 167, 64, 0.26);
+  background: rgba(242, 167, 64, 0.14);
+  color: #e6c486;
+}
+
 .bottom-tab--alerts-active {
   background: #ffe7df;
   color: #b34242;
+}
+
+.bottom-tab--low-stock-active {
+  background: #fff3e7;
+  color: #a86518;
 }
 
 .bottom-tab__icon-wrap {
@@ -1515,6 +1567,14 @@ textarea:focus-visible,
 
 .bottom-tab--alerts-active .bottom-tab__badge {
   background: #b34242;
+}
+
+.bottom-tab--low-stock .bottom-tab__badge {
+  background: #d89a34;
+}
+
+.bottom-tab--low-stock-active .bottom-tab__badge {
+  background: #a86518;
 }
 
 .bottom-tab__badge-text {

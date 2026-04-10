@@ -6,7 +6,10 @@ export type ProfileRecord = {
   id: string;
   full_name: string | null;
   avatar_url: string | null;
+  email?: string | null;
+  notify_fifteen_days_before_expiry?: boolean | null;
   notify_one_day_before_expiry?: boolean | null;
+  notify_thirty_days_before_expiry?: boolean | null;
   notify_three_days_before_expiry?: boolean | null;
   created_at: string | null;
   updated_at: string | null;
@@ -70,7 +73,9 @@ function getProfileDefaults(user: User) {
     avatar_url: avatarUrl,
     full_name: fullName,
     id: user.id,
+    notify_fifteen_days_before_expiry: true,
     notify_one_day_before_expiry: true,
+    notify_thirty_days_before_expiry: true,
     notify_three_days_before_expiry: true,
   };
 }
@@ -117,7 +122,9 @@ export async function updateProfile(
       ProfileRecord,
       | "avatar_url"
       | "full_name"
+      | "notify_fifteen_days_before_expiry"
       | "notify_one_day_before_expiry"
+      | "notify_thirty_days_before_expiry"
       | "notify_three_days_before_expiry"
     >
   >,
