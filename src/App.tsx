@@ -21,6 +21,7 @@ import {
   IoLayers,
   IoLayersOutline,
   IoLeafOutline,
+  IoLogoGoogle,
   IoNotifications,
   IoNotificationsOutline,
   IoNutritionOutline,
@@ -40,6 +41,7 @@ import {
 
 import BrandMark from "./components/BrandMark";
 import BarcodeScannerModal from "./components/BarcodeScannerModal";
+import AuthCallbackPage from "./pages/AuthCallbackPage";
 import DataDeletionPage from "./pages/DataDeletionPage";
 import PrivacyPolicyPage from "./pages/PrivacyPolicyPage";
 import {
@@ -78,6 +80,7 @@ import {
 import {
   isSupabaseConfigured,
   signInWithEmailPassword,
+  signInWithOAuthProvider,
   signOutCurrentUser,
   signUpWithEmailPassword,
   supabase,
@@ -85,6 +88,7 @@ import {
 
 type TabKey = "home" | "inventory" | "low_stock" | "alerts" | "profile";
 type AuthMode = "login" | "register";
+type OAuthProvider = "google";
 type CategoryValue = "Fruits & Veggies" | "Fridge Items" | "Pantry";
 type FieldKey = "email" | "password" | "confirmPassword";
 type FieldErrors = Partial<Record<FieldKey, string>>;
@@ -159,6 +163,7 @@ const DASHBOARD_TAB_PATHS: Record<TabKey, string> = {
 };
 
 const PUBLIC_LEGAL_PATHS = new Set(["/privacy-policy", "/data-deletion"]);
+const AUTH_CALLBACK_PATH = "/auth/callback";
 
 function isDashboardPath(pathname: string) {
   return Object.values(DASHBOARD_TAB_PATHS).includes(pathname);
@@ -166,6 +171,10 @@ function isDashboardPath(pathname: string) {
 
 function isPublicLegalPath(pathname: string) {
   return PUBLIC_LEGAL_PATHS.has(pathname);
+}
+
+function isAuthCallbackPath(pathname: string) {
+  return pathname === AUTH_CALLBACK_PATH;
 }
 
 function getDashboardTabFromPath(pathname: string): TabKey {
@@ -698,6 +707,7 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
     title: string;
   } | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [activeOAuthProvider, setActiveOAuthProvider] = useState<OAuthProvider | null>(null);
 
   useEffect(() => {
     setFieldErrors({});
@@ -808,6 +818,43 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
     }
   }
 
+  async function handleOAuthSignIn(provider: OAuthProvider) {
+    if (!isSupabaseConfigured) {
+      setErrorMessage(
+        "Supabase is not configured yet. Add your Vite public keys in web/.env and restart the app.",
+      );
+      return;
+    }
+
+    try {
+      setActiveOAuthProvider(provider);
+      setIsSubmitting(true);
+      setErrorMessage(null);
+      setSuccessMessage(null);
+      setAuthNotice(null);
+
+      const redirectTo = `${window.location.origin}${AUTH_CALLBACK_PATH}`;
+      const { data, error } = await signInWithOAuthProvider(provider, redirectTo);
+
+      if (error) {
+        throw error;
+      }
+
+      if (!data.url) {
+        throw new Error("Unable to start Google sign-in.");
+      }
+
+      window.location.assign(data.url);
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Something went wrong. Please try again.",
+      );
+    } finally {
+      setIsSubmitting(false);
+      setActiveOAuthProvider(null);
+    }
+  }
+
   return (
     <div className="auth-page">
       <div className="auth-shell">
@@ -866,6 +913,31 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess?: () => void }) {
                 }}
               >
                 Register
+              </button>
+            </div>
+
+            <div className="auth-oauth">
+              <div className="auth-oauth__divider">
+                <span className="auth-oauth__divider-line" />
+                <span className="auth-oauth__divider-text">Or continue with</span>
+                <span className="auth-oauth__divider-line" />
+              </div>
+              <button
+                className="auth-oauth__button"
+                disabled={isSubmitting}
+                type="button"
+                onClick={() => void handleOAuthSignIn("google")}
+              >
+                {isSubmitting && activeOAuthProvider === "google" ? (
+                  <span className="auth-oauth__spinner" aria-hidden="true" />
+                ) : (
+                  <IoLogoGoogle color="#DB4437" size={18} />
+                )}
+                <span className="auth-oauth__button-text">
+                  {isSubmitting && activeOAuthProvider === "google"
+                    ? "Connecting..."
+                    : "Continue with Google"}
+                </span>
               </button>
             </div>
 
@@ -2321,6 +2393,8 @@ function DashboardScreen({
                           <img
                             alt={`${item.name} photo`}
                             className="inventory-image"
+                            decoding="async"
+                            loading="lazy"
                             src={item.photo_url}
                           />
                         </button>
@@ -2472,7 +2546,13 @@ function DashboardScreen({
                   <div className="inventory-row inventory-row--top">
                     <div className="inventory-media">
                       {item.photo_url ? (
-                        <img alt={`${item.name} photo`} className="inventory-image" src={item.photo_url} />
+                        <img
+                          alt={`${item.name} photo`}
+                          className="inventory-image"
+                          decoding="async"
+                          loading="lazy"
+                          src={item.photo_url}
+                        />
                       ) : (
                         <span className="inventory-fallback">o</span>
                       )}
@@ -2602,7 +2682,13 @@ function DashboardScreen({
                   <div className="inventory-row inventory-row--top">
                     <div className="inventory-media">
                       {item.photo_url ? (
-                        <img alt={`${item.name} photo`} className="inventory-image" src={item.photo_url} />
+                        <img
+                          alt={`${item.name} photo`}
+                          className="inventory-image"
+                          decoding="async"
+                          loading="lazy"
+                          src={item.photo_url}
+                        />
                       ) : (
                         <span className="inventory-fallback">o</span>
                       )}
@@ -3268,7 +3354,7 @@ function PantryItemFormScreen({
         }
 
         const matchedPantryItem =
-          (data ?? []).find((item) =>
+          (data ?? []).find((item: PantryItemRecord) =>
             pantryBarcodeMatches(normalizedBarcode, getPantryItemBarcode(item)),
           ) ?? null;
 
@@ -4176,7 +4262,13 @@ function ExpiredItemsScreen({
                     <div className="inventory-row inventory-row--top">
                       <div className="inventory-media">
                         {item.photo_url ? (
-                          <img alt={`${item.name} photo`} className="inventory-image" src={item.photo_url} />
+                          <img
+                            alt={`${item.name} photo`}
+                            className="inventory-image"
+                            decoding="async"
+                            loading="lazy"
+                            src={item.photo_url}
+                          />
                         ) : (
                           <span className="inventory-fallback">o</span>
                         )}
@@ -4508,6 +4600,7 @@ export default function App() {
   const editMatch = location.pathname.match(/^\/item\/([^/]+)\/edit$/);
   const editItemId = editMatch ? decodeURIComponent(editMatch[1]) : null;
   const activeDashboardTab = getDashboardTabFromPath(displayLocation.pathname);
+  const isOAuthCallbackRoute = isAuthCallbackPath(location.pathname);
   const routeInventorySpace = useMemo(() => {
     const searchParams = new URLSearchParams(location.search);
     return normalizeInventorySpace(searchParams.get("space")) ?? "kitchen";
@@ -4668,6 +4761,18 @@ export default function App() {
         <Route path="*" element={<Navigate replace to="/privacy-policy" />} />
       </Routes>
     );
+  }
+
+  if (isOAuthCallbackRoute) {
+    if (!authReady) {
+      return <AuthCallbackPage />;
+    }
+
+    if (session && authenticatedUserId) {
+      return <Navigate replace to="/" />;
+    }
+
+    return <AuthCallbackPage isError />;
   }
 
   if (splashVisible) {

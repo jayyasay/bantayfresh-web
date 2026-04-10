@@ -35,6 +35,20 @@ export async function signInWithEmailPassword(credentials: {
   return requireSupabaseClient().auth.signInWithPassword(credentials);
 }
 
+export type OAuthProvider = "google";
+
+export async function signInWithOAuthProvider(
+  provider: OAuthProvider,
+  redirectTo: string,
+) {
+  return requireSupabaseClient().auth.signInWithOAuth({
+    provider,
+    options: {
+      redirectTo,
+    },
+  });
+}
+
 export async function signUpWithEmailPassword(credentials: {
   email: string;
   password: string;

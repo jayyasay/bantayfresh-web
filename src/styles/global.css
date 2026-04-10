@@ -1724,6 +1724,137 @@ textarea:focus-visible,
   color: var(--night);
 }
 
+.auth-oauth {
+  display: grid;
+  gap: 12px;
+}
+
+.auth-oauth__divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.auth-oauth__divider-line {
+  flex: 1;
+  height: 1px;
+  background: var(--page-line);
+}
+
+.auth-oauth__divider-text {
+  color: var(--text-soft);
+  font-size: 0.8rem;
+  line-height: 1.2;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.auth-oauth__button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 52px;
+  border-radius: 18px;
+  border: 1px solid var(--page-line);
+  background: var(--surface);
+  color: var(--text-dark);
+  font-size: 0.95rem;
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(15, 42, 26, 0.05);
+}
+
+.auth-oauth__button:disabled {
+  opacity: 0.7;
+}
+
+.auth-oauth__button-text {
+  line-height: 1;
+}
+
+.auth-oauth__spinner,
+.auth-callback-spinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 2px solid rgba(11, 123, 68, 0.22);
+  border-top-color: var(--deep-green);
+  animation: spin 900ms linear infinite;
+}
+
+.auth-callback-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+}
+
+.auth-callback-card {
+  width: min(100%, 420px);
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+  border-radius: 32px;
+  border: 1px solid rgba(216, 231, 221, 0.92);
+  background: rgba(255, 255, 255, 0.92);
+  padding: 28px 22px;
+  text-align: center;
+  box-shadow:
+    0 24px 80px rgba(15, 42, 26, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+.auth-callback-mark {
+  width: 84px;
+  height: 84px;
+  border-radius: 24px;
+  overflow: hidden;
+  box-shadow: 0 12px 28px rgba(8, 24, 16, 0.24);
+}
+
+.auth-callback-eyebrow {
+  margin: 0;
+  color: var(--deep-green);
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.auth-callback-title {
+  margin: 0;
+  color: var(--text-dark);
+  font-size: 1.6rem;
+  line-height: 1.15;
+  font-weight: 900;
+}
+
+.auth-callback-body {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+
+.auth-callback-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 48px;
+  padding: 0 18px;
+  border-radius: 999px;
+  background: var(--fresh-green);
+  color: var(--night);
+  font-size: 0.92rem;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.auth-callback-link:hover {
+  text-decoration: none;
+}
+
 .auth-confirmation {
   display: grid;
   gap: 4px;

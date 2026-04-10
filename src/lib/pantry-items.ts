@@ -63,6 +63,29 @@ type PantryItemNotesSource =
   | null
   | undefined;
 
+type PantryListCacheEntry = {
+  data: PantryItemRecord[];
+  expiresAt: number;
+};
+
+type PantryItemCacheEntry = {
+  data: PantryItemRecord;
+  expiresAt: number;
+};
+
+type BarcodeLookupCacheEntry = {
+  data: BarcodeLookupRecord | null;
+  expiresAt: number;
+};
+
+const PANTRY_QUERY_CACHE_TTL_MS = 5 * 60 * 1000;
+const pantryItemsListCache = new Map<string, PantryListCacheEntry>();
+const pantryItemsListRequests = new Map<string, Promise<{ data: PantryItemRecord[] | null; error: unknown }>>();
+const pantryItemCache = new Map<string, PantryItemCacheEntry>();
+const pantryItemRequests = new Map<string, Promise<{ data: PantryItemRecord | null; error: unknown }>>();
+const barcodeLookupCache = new Map<string, BarcodeLookupCacheEntry>();
+const barcodeLookupRequests = new Map<string, Promise<{ data: BarcodeLookupRecord | null; error: unknown }>>();
+
 const PANTRY_ITEM_COLUMNS =
   "id, user_id, barcode, name, category, quantity, unit, expiry_date, photo_url, space, stock_status, notes, created_at, updated_at";
 
@@ -100,6 +123,69 @@ function getSourceNotes(value: PantryItemNotesSource) {
   }
 
   return value?.notes ?? null;
+}
+
+function getListCacheKey(userId: string) {
+  return userId;
+}
+
+function getItemCacheKey(userId: string, itemId: string) {
+  return `${userId}:${itemId}`;
+}
+
+function getBarcodeCacheKey(barcode: string) {
+  return getBarcodeLookupCandidates(barcode)[0] ?? barcode.trim();
+}
+
+function primePantryItemCaches(userId: string, items: PantryItemRecord[]) {
+  const now = Date.now();
+  pantryItemsListCache.set(getListCacheKey(userId), {
+    data: items,
+    expiresAt: now + PANTRY_QUERY_CACHE_TTL_MS,
+  });
+
+  items.forEach((item) => {
+    pantryItemCache.set(getItemCacheKey(userId, item.id), {
+      data: item,
+      expiresAt: now + PANTRY_QUERY_CACHE_TTL_MS,
+    });
+  });
+}
+
+export function invalidatePantryItemsCache(userId?: string) {
+  if (userId) {
+    pantryItemsListCache.delete(getListCacheKey(userId));
+  } else {
+    pantryItemsListCache.clear();
+  }
+
+  pantryItemsListRequests.clear();
+}
+
+export function invalidatePantryItemCache(userId?: string, itemId?: string) {
+  if (userId && itemId) {
+    pantryItemCache.delete(getItemCacheKey(userId, itemId));
+  } else if (userId) {
+    for (const key of pantryItemCache.keys()) {
+      if (key.startsWith(`${userId}:`)) {
+        pantryItemCache.delete(key);
+      }
+    }
+  } else {
+    pantryItemCache.clear();
+  }
+
+  pantryItemRequests.clear();
+}
+
+export function invalidateBarcodeLookupCache(barcode?: string) {
+  if (barcode) {
+    barcodeLookupCache.delete(getBarcodeCacheKey(barcode));
+    return;
+  }
+
+  barcodeLookupCache.clear();
+  barcodeLookupRequests.clear();
 }
 
 export function normalizePantryItemStockStatus(
@@ -207,25 +293,80 @@ export function composePantryItemNotes(
 }
 
 export async function listPantryItems(userId: string) {
-  return requireSupabaseClient()
+  const cacheKey = getListCacheKey(userId);
+  const cached = pantryItemsListCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { data: cached.data, error: null };
+  }
+
+  const inFlight = pantryItemsListRequests.get(cacheKey);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const request = requireSupabaseClient()
     .from("pantry_items")
     .select(PANTRY_ITEM_COLUMNS)
     .eq("user_id", userId)
     .order("expiry_date", { ascending: true, nullsFirst: false })
     .order("created_at", { ascending: false });
+
+  const wrapped = Promise.resolve(request)
+    .then(({ data, error }) => {
+      if (!error && data) {
+        primePantryItemCaches(userId, data);
+      }
+
+      return { data, error };
+    })
+    .finally(() => {
+      pantryItemsListRequests.delete(cacheKey);
+    });
+
+  pantryItemsListRequests.set(cacheKey, wrapped);
+  return wrapped;
 }
 
 export async function getPantryItem(userId: string, itemId: string) {
-  return requireSupabaseClient()
+  const cacheKey = getItemCacheKey(userId, itemId);
+  const cached = pantryItemCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { data: cached.data, error: null };
+  }
+
+  const inFlight = pantryItemRequests.get(cacheKey);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const request = requireSupabaseClient()
     .from("pantry_items")
     .select(PANTRY_ITEM_COLUMNS)
     .eq("user_id", userId)
     .eq("id", itemId)
     .single();
+
+  const wrapped = Promise.resolve(request)
+    .then(({ data, error }) => {
+      if (!error && data) {
+        pantryItemCache.set(cacheKey, {
+          data,
+          expiresAt: Date.now() + PANTRY_QUERY_CACHE_TTL_MS,
+        });
+      }
+
+      return { data, error };
+    })
+    .finally(() => {
+      pantryItemRequests.delete(cacheKey);
+    });
+
+  pantryItemRequests.set(cacheKey, wrapped);
+  return wrapped;
 }
 
 export async function createPantryItem(userId: string, item: PantryItemInsert) {
-  return requireSupabaseClient()
+  const result = await requireSupabaseClient()
     .from("pantry_items")
     .insert({
       user_id: userId,
@@ -242,10 +383,20 @@ export async function createPantryItem(userId: string, item: PantryItemInsert) {
     })
     .select(PANTRY_ITEM_COLUMNS)
     .single();
+
+  if (result.data) {
+    invalidatePantryItemsCache(userId);
+    pantryItemCache.set(getItemCacheKey(userId, result.data.id), {
+      data: result.data,
+      expiresAt: Date.now() + PANTRY_QUERY_CACHE_TTL_MS,
+    });
+  }
+
+  return result;
 }
 
 export async function bulkCreatePantryItems(userId: string, items: PantryItemInsert[]) {
-  return requireSupabaseClient()
+  const result = await requireSupabaseClient()
     .from("pantry_items")
     .insert(
       items.map((item) => ({
@@ -263,6 +414,13 @@ export async function bulkCreatePantryItems(userId: string, items: PantryItemIns
       })),
     )
     .select(PANTRY_ITEM_COLUMNS);
+
+  if (!result.error && result.data) {
+    invalidatePantryItemsCache(userId);
+    primePantryItemCaches(userId, result.data);
+  }
+
+  return result;
 }
 
 export async function uploadPantryItemPhoto(userId: string, file: File) {
@@ -320,16 +478,26 @@ export async function updatePantryItem(
     patch.notes = item.notes?.trim() || null;
   }
 
-  return requireSupabaseClient()
+  const result = await requireSupabaseClient()
     .from("pantry_items")
     .update({
       ...patch,
       user_id: userId,
     })
     .eq("id", itemId)
-    .eq("user_id", userId)
+      .eq("user_id", userId)
     .select(PANTRY_ITEM_COLUMNS)
     .single();
+
+  if (result.data) {
+    invalidatePantryItemsCache(userId);
+    pantryItemCache.set(getItemCacheKey(userId, itemId), {
+      data: result.data,
+      expiresAt: Date.now() + PANTRY_QUERY_CACHE_TTL_MS,
+    });
+  }
+
+  return result;
 }
 
 export async function findPantryItemByBarcode(barcode: string) {
@@ -338,28 +506,53 @@ export async function findPantryItemByBarcode(barcode: string) {
     return { data: null, error: null };
   }
 
-  const { data, error } = await requireSupabaseClient()
+  const cacheKey = getBarcodeCacheKey(barcode);
+  const cached = barcodeLookupCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { data: cached.data, error: null };
+  }
+
+  const inFlight = barcodeLookupRequests.get(cacheKey);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const request = requireSupabaseClient()
     .from("barcode_product_lookup")
     .select("barcode, product_name")
     .in("barcode", candidates);
 
-  if (error) {
-    return { data: null, error };
-  }
+  const wrapped = Promise.resolve(request)
+    .then(({ data, error }) => {
+      if (error) {
+        return { data: null, error };
+      }
 
-  const matchedRecord =
-    candidates
-      .map((candidate) => data?.find((record) => record.barcode === candidate) ?? null)
-      .find(Boolean) ?? null;
+      const matchedRecord =
+        candidates
+          .map((candidate) => data?.find((record) => record.barcode === candidate) ?? null)
+          .find(Boolean) ?? null;
 
-  return { data: matchedRecord, error: null };
+      barcodeLookupCache.set(cacheKey, {
+        data: matchedRecord,
+        expiresAt: Date.now() + PANTRY_QUERY_CACHE_TTL_MS,
+      });
+
+      return { data: matchedRecord, error: null };
+    })
+    .finally(() => {
+      barcodeLookupRequests.delete(cacheKey);
+    });
+
+  barcodeLookupRequests.set(cacheKey, wrapped);
+  return wrapped;
 }
 
 export async function upsertBarcodeProductLookup(barcode: string, productName: string) {
   const normalizedBarcode = barcode.trim();
   const normalizedProductName = productName.trim();
 
-  return requireSupabaseClient()
+  const result = await requireSupabaseClient()
     .from("barcode_product_lookup")
     .upsert(
       {
@@ -373,12 +566,25 @@ export async function upsertBarcodeProductLookup(barcode: string, productName: s
     )
     .select("barcode, product_name")
     .single();
+
+  if (!result.error) {
+    invalidateBarcodeLookupCache(normalizedBarcode);
+  }
+
+  return result;
 }
 
 export async function deletePantryItem(userId: string, itemId: string) {
-  return requireSupabaseClient()
+  const result = await requireSupabaseClient()
     .from("pantry_items")
     .delete()
     .eq("id", itemId)
     .eq("user_id", userId);
+
+  if (!result.error) {
+    invalidatePantryItemsCache(userId);
+    invalidatePantryItemCache(userId, itemId);
+  }
+
+  return result;
 }
